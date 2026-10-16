@@ -216,8 +216,10 @@ interrupted too easily, or set it to `1` if it is too hard to interrupt.
 
 ## 9. Cost and deployment safeguards
 
-**No deployment is performed by this repository, and no billing settings are touched.** There is no
-CI, no Dockerfile, no deploy script, and no LiveKit Cloud deployment step.
+**This repository contains no CI and no deploy automation.** It ships the deployment inputs
+(`Dockerfile`, `.dockerignore`) but running `lk agent create` / `lk agent deploy` — the only steps
+that create billable cloud resources — is always an explicit, manual action. Nothing is deployed
+automatically, and no billing settings are touched by this repository.
 
 Services that require credentials, and their cost characteristics:
 
@@ -237,11 +239,75 @@ its own Phonic key. Do not point it at a LiveKit project used by another product
 
 ---
 
-## 10. Files
+## 10. Deploy to LiveKit Cloud
+
+The agent deploys as a container built by the LiveKit Cloud build service, using the `Dockerfile`
+and `.dockerignore` in this repo (adapted from the official Node.js template at
+<https://docs.livekit.io/agents/ops/deployment/builds/>). The image uses **Node 24**, installs
+`ca-certificates` (required by the LiveKit SDK's native TLS stack), runs as an unprivileged
+`appuser`, and starts with `npm start`.
+
+### Prerequisites
+
+| Item | Where to get it |
+| --- | --- |
+| LiveKit CLI (`lk`) | <https://docs.livekit.io/reference/developer-tools/livekit-cli/> |
+| LiveKit project credentials | LiveKit Cloud dashboard → Project settings → Keys (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`) |
+| Phonic key | Phonic console → API keys (`PHONIC_API_KEY`) |
+
+### 1. Authenticate
+
+```bash
+lk cloud auth          # interactive browser flow (recommended)
+```
+
+For a non-interactive environment, register the project with keys instead:
+
+```bash
+lk project add <name> --url wss://<project>.livekit.cloud \
+  --api-key "$LIVEKIT_API_KEY" --api-secret "$LIVEKIT_API_SECRET" --default
+```
+
+### 2. Create the agent (first deploy)
+
+`lk agent create` registers the agent, writes `livekit.toml`, builds the image, and deploys the
+first version. Secrets are read from a `.env.local` file (gitignored), or passed with `--secrets`.
+
+```bash
+cp .env.example .env.local      # then fill in the real values
+lk agent create --secrets-file .env.local
+```
+
+LiveKit Cloud injects `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` automatically, so
+only `PHONIC_API_KEY` (and optional tuning values) strictly needs to be supplied as a secret.
+
+### 3. Subsequent deploys and monitoring
+
+```bash
+lk agent deploy                 # ship a new version
+lk agent status                 # deployment status
+lk agent logs                   # runtime logs
+lk agent secrets                # list secret names (values are never shown)
+```
+
+### 4. Talk to it
+
+```bash
+lk agent console                # browser-based voice console, no frontend needed
+```
+
+`lk agent create` / `lk agent deploy` upload your build context to LiveKit Cloud, which creates
+billable resources on your LiveKit project. Confirm the target project before running them.
+
+---
+
+## 11. Files
 
 ```
 .env.example        Placeholder values for the four required variables
 .gitignore          Excludes .env and other secret-bearing files
+Dockerfile          Deployment image (Node 24, non-root, `npm start`) for LiveKit Cloud builds
+.dockerignore       Keeps tests, secrets and docs out of the build context
 package.json        Dependencies and scripts
 tsconfig.json       Type-check configuration (NodeNext, strict, no emit)
 src/main.ts         Agent entry point: defineAgent + AgentSession + Phonic model + cli.runApp
@@ -256,7 +322,7 @@ tests/*.test.ts     Unit tests (no network, no paid calls)
 
 ---
 
-## 11. Unresolved questions
+## 12. Unresolved questions
 
 1. **Exact Phonic billing granularity** — pricing is published per minute, but per-second rounding,
    minimum session length, and whether a failed/no-audio session is billed are not documented on the
