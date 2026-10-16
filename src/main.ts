@@ -19,7 +19,10 @@ import { createRealtimeModel, resolvePhonicOptions } from './phonic.ts';
 
 // Load .env before anything reads process.env (ServerOptions resolves
 // LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET when it is constructed).
-dotenv.config({ path: '.env', quiet: true });
+// Resolved relative to this file rather than the current working directory, so
+// the agent also picks up .env when launched from another directory (e.g. a
+// process manager or `lk agent start`).
+dotenv.config({ path: fileURLToPath(new URL('../.env', import.meta.url)), quiet: true });
 
 export default defineAgent({
   entry: async (ctx: JobContext) => {

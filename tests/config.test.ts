@@ -13,6 +13,7 @@ import {
   readIntEnv,
   redactSecrets,
   safeEnvSummary,
+  validateLivekitUrl,
 } from '../src/config.ts';
 
 /** A complete, fake environment. Values here are obviously not real keys. */
@@ -116,5 +117,47 @@ describe('readIntEnv', () => {
     assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: '4' }), 4);
     assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: 'abc' }), 2);
     assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: '-1' }), 2);
+  });
+});
+
+describe('validateLivekitUrl', () => {
+  it('accepts a LiveKit Cloud wss:// URL', () => {
+    const check = validateLivekitUrl('wss://my-project.livekit.cloud');
+    assert.equal(check.ok, true);
+    assert.deepEqual(check.problems, []);
+    assert.equal(check.scheme, 'wss:');
+    assert.equal(check.host, 'my-project.livekit.cloud');
+  });
+
+  it('accepts a local self-hosted ws:// URL but warns it cannot be LiveKit Cloud', () => {
+    const check = validateLivekitUrl('ws://127.0.0.1:7880');
+    assert.equal(check.ok, true);
+    assert.equal(check.warnings.length, 1);
+    assert.match(check.warnings[0]!, /cannot reach LiveKit Cloud/);
+  });
+
+  it('rejects an http(s):// URL', () => {
+    const check = validateLivekitUrl('https://my-project.livekit.cloud');
+    assert.equal(check.ok, false);
+    assert.match(check.problems[0]!, /needs a WebSocket URL/);
+  });
+
+  it('rejects insecure ws:// for a remote host', () => {
+    const check = validateLivekitUrl('ws://my-project.livekit.cloud');
+    assert.equal(check.ok, false);
+    assert.match(check.problems[0]!, /requires "wss:\/\//);
+  });
+
+  it('rejects missing and unparseable values', () => {
+    assert.equal(validateLivekitUrl(undefined).ok, false);
+    assert.match(validateLivekitUrl(undefined).problems[0]!, /not set/);
+    assert.equal(validateLivekitUrl('my-project.livekit.cloud').ok, false);
+    assert.match(validateLivekitUrl('my-project.livekit.cloud').problems[0]!, /not a valid URL/);
+  });
+
+  it('warns about a non-cloud wss:// host', () => {
+    const check = validateLivekitUrl('wss://livekit.internal.example.com');
+    assert.equal(check.ok, true);
+    assert.match(check.warnings[0]!, /not a \*\.livekit\.cloud host/);
   });
 });

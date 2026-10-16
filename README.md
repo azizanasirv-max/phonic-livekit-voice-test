@@ -56,7 +56,7 @@ npm run download-files
 ```bash
 cp .env.example .env
 # then edit .env and fill in the four required values
-npm run check:env        # prints a masked summary, exits non-zero if anything is missing
+npm run check:env        # masked summary + LIVEKIT_URL scheme check; exits non-zero on problems
 ```
 
 | Variable | Required | Secret? | Where to get it |
@@ -149,12 +149,12 @@ npm run typecheck   # must pass cleanly
 npm test
 ```
 
-`npm test` runs 21 unit tests in three files. **None of them make network requests or call a paid
+`npm test` runs 27 unit tests in three files. **None of them make network requests or call a paid
 API:**
 
 | File | Covers |
 | --- | --- |
-| `tests/config.test.ts` | Env validation, missing-variable reporting, credential masking/redaction |
+| `tests/config.test.ts` | Env validation, missing-variable reporting, credential masking/redaction, `LIVEKIT_URL` scheme validation |
 | `tests/instructions.test.ts` | The prompt is concise and contains the interruption/backchannel rules |
 | `tests/phonic.test.ts` | The Phonic model is constructed with the documented options and fails cleanly without a key |
 
@@ -166,7 +166,7 @@ conversation plus a human microphone, so it stays manual (section 8).
 | Check | Command | Result |
 | --- | --- | --- |
 | Type check | `npm run typecheck` | ✅ 0 errors |
-| Unit tests | `npm test` | ✅ 21 passed / 0 failed |
+| Unit tests | `npm test` | ✅ 27 passed / 0 failed |
 | Agent boots | `node src/main.ts dev` | ✅ Worker starts, binds a random port, then retries the LiveKit connection |
 | Connection error path | `node src/main.ts dev` with an unreachable `LIVEKIT_URL` | ✅ Clear `failed to connect to LiveKit server (ws://127.0.0.1:7880), retrying in 2 seconds: (1/10)` messages |
 | Missing config path | `npm run check:env` with no `.env` | ✅ Exits `1` with `Missing required environment variable(s): PHONIC_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET` |
@@ -201,7 +201,11 @@ interrupted too easily, or set it to `1` if it is too hard to interrupt.
 | --- | --- |
 | `Missing required environment variable(s): …` | `.env` is missing or incomplete. Run `npm run check:env`. |
 | `Phonic API key is required. Provide apiKey or set PHONIC_API_KEY.` | `PHONIC_API_KEY` is empty in the environment the agent runs in. |
+| `failed to connect …: connect ECONNREFUSED 127.0.0.1:7880` | `LIVEKIT_URL` still points at a local/self-hosted server. For LiveKit Cloud it must be `wss://<project>.livekit.cloud`. `npm run check:env` now flags this. |
+| `failed to connect …: Unexpected server response: 401` | TLS/WebSocket reached LiveKit, but it rejected the credentials. The `LIVEKIT_API_KEY` / `LIVEKIT_API_SECRET` pair is wrong, from a different project, or revoked — or the project name in `LIVEKIT_URL` does not match those keys. Re-copy both values from Project settings → Keys. |
+| `failed to connect …: getaddrinfo ENOTFOUND` / `EAI_AGAIN` | DNS or network problem, or a typo in the project subdomain. Check that the host in `LIVEKIT_URL` exists. |
 | `failed to connect to LiveKit server (…), retrying…` then gives up | Wrong `LIVEKIT_URL`, wrong key/secret, or the LiveKit server is unreachable. Cloud URLs must start with `wss://`. |
+| Agent picks up the wrong URL even though `.env` looks right | A stale `LIVEKIT_URL` (or key/secret) exported in your shell wins over `.env` — dotenv does not override already-set variables. Run `env | grep LIVEKIT` and `unset` the stale ones, or start from a clean shell. |
 | `Error: listen EADDRINUSE: address already in use 0.0.0.0:8081` | `npm start` (production mode) always binds port 8081. Stop the other process or use `npm run dev`, which binds a random free port. |
 | Agent starts but nobody joins the room | With `LIVEKIT_AGENT_NAME` set, dispatch is explicit — the room token must request that agent name, otherwise the agent is never assigned. Unset it for automatic dispatch. |
 | Agent joins but you hear nothing | Check microphone permission in the browser/terminal, that you joined the same room, and that the Phonic conversation was created (look for `phonic conversation created` in the logs). |

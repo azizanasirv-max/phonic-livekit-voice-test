@@ -120,3 +120,81 @@ export function readIntEnv(
   const parsed = Number.parseInt(raw, 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
 }
+
+/** Hostnames that mean "a LiveKit server running locally". */
+const LOCAL_HOSTNAMES = new Set(['localhost', '127.0.0.1', '0.0.0.0', '::1', '[::1]']);
+
+export type LivekitUrlCheck = {
+  ok: boolean;
+  scheme?: string;
+  host?: string;
+  port?: string;
+  problems: string[];
+  warnings: string[];
+};
+
+/**
+ * Validate `LIVEKIT_URL` before startup.
+ *
+ * A `ws://` URL pointing at localhost, or an `http(s)://` URL, are the two most
+ * common reasons an agent never reaches LiveKit Cloud — the agent retries and
+ * fails with a connection error that does not mention the URL scheme. `problems`
+ * must fail the run; `warnings` are informational (a local server is legitimate).
+ */
+export function validateLivekitUrl(url?: string): LivekitUrlCheck {
+  const problems: string[] = [];
+  const warnings: string[] = [];
+  const value = url?.trim();
+
+  if (value === undefined || value === '') {
+    return { ok: false, problems: ['LIVEKIT_URL is not set.'], warnings };
+  }
+
+  let parsed: URL;
+  try {
+    parsed = new URL(value);
+  } catch {
+    return {
+      ok: false,
+      problems: [
+        `LIVEKIT_URL is not a valid URL (got "${value.split(':')[0]}:"). ` +
+          'Expected wss://<project>.livekit.cloud for LiveKit Cloud.',
+      ],
+      warnings,
+    };
+  }
+
+  const scheme = parsed.protocol;
+  const host = parsed.hostname;
+  const port = parsed.port;
+  const isLocal = LOCAL_HOSTNAMES.has(host);
+
+  if (scheme === 'http:' || scheme === 'https:') {
+    problems.push(
+      `LIVEKIT_URL uses "${scheme}//" — LiveKit needs a WebSocket URL. ` +
+        `Use "wss://${parsed.host}" for LiveKit Cloud (or "ws://localhost:7880" for a local server).`,
+    );
+  } else if (scheme === 'ws:') {
+    if (isLocal) {
+      warnings.push(
+        `LIVEKIT_URL points at a local/self-hosted LiveKit server (${value}). ` +
+          'This cannot reach LiveKit Cloud — for Cloud use wss://<project>.livekit.cloud.',
+      );
+    } else {
+      problems.push(
+        `LIVEKIT_URL uses insecure "ws://" for remote host "${host}". ` +
+          `LiveKit Cloud requires "wss://${parsed.host}".`,
+      );
+    }
+  } else if (scheme !== 'wss:') {
+    problems.push(`LIVEKIT_URL has unsupported scheme "${scheme}". Expected "wss://".`);
+  } else if (!host.endsWith('.livekit.cloud') && !isLocal) {
+    warnings.push(
+      `LIVEKIT_URL host "${host}" is not a *.livekit.cloud host. ` +
+        'That is fine for a self-hosted server; otherwise double-check your project URL.',
+    );
+  }
+
+  return { ok: problems.length === 0, scheme, host, port, problems, warnings };
+}
+
