@@ -317,6 +317,23 @@ The workflow lives at **`.github/workflows/deploy.yml`**. It deploys the agent u
 > open `.github/deploy-workflow.yml` on GitHub → **Edit** (pencil) → change the filename to
 > `.github/workflows/deploy.yml` → **Commit changes**. GitHub creates the folder automatically.
 > The file is inert until it lives under `.github/workflows/`.
+>
+> **The workflow must end up on the default branch.** GitHub only shows the *Run workflow* button
+> when the workflow file exists on the default branch, and the run deploys whatever branch you
+> select. This branch is the one that also carries `Dockerfile` and `.dockerignore`, so merge it
+> (see *Open the pull request* below) rather than adding the workflow to the default branch on its
+> own — otherwise the deployment fails the "required deployment files exist" check.
+
+### 6. Open the pull request
+
+The default branch of this repository is `cline/afhrhgja`, which does **not** yet contain the
+`Dockerfile`, `.dockerignore`, or this workflow. Bring them over with a pull request:
+
+1. Open <https://github.com/azizanasirv-max/phonic-livekit-voice-test/pull/new/cline/chxv51c3>
+   (base `cline/afhrhgja` ← compare `cline/chxv51c3`).
+2. Click **Create pull request**, then **Merge pull request**.
+
+After the merge the default branch holds everything the deployment needs.
 
 Add four **repository secrets** under *Settings → Secrets and variables → Actions → Repository
 secrets*:
