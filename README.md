@@ -216,10 +216,10 @@ interrupted too easily, or set it to `1` if it is too hard to interrupt.
 
 ## 9. Cost and deployment safeguards
 
-**This repository contains no CI and no deploy automation.** It ships the deployment inputs
-(`Dockerfile`, `.dockerignore`) but running `lk agent create` / `lk agent deploy` — the only steps
-that create billable cloud resources — is always an explicit, manual action. Nothing is deployed
-automatically, and no billing settings are touched by this repository.
+**Nothing is deployed automatically.** `.github/workflows/deploy.yml` is `workflow_dispatch`-only —
+it has no `push` and no `pull_request` trigger — so a deployment to LiveKit Cloud (the step that
+creates billable resources) only ever happens when a human explicitly starts a run. No billing
+settings are touched by this repository.
 
 Services that require credentials, and their cost characteristics:
 
@@ -292,12 +292,54 @@ lk agent secrets                # list secret names (values are never shown)
 
 ### 4. Talk to it
 
+For a **deployed** agent, open the **LiveKit Cloud dashboard → Agents → your agent → Console**
+and click **Start a session**, then use the microphone button. With `LIVEKIT_AGENT_NAME` unset the
+agent uses automatic dispatch, so it joins any new room in the project.
+
+To talk to the agent **locally** instead (needs a local `.env`, not a deployment):
+
 ```bash
-lk agent console                # browser-based voice console, no frontend needed
+lk agent console                # runs the agent on your machine and pipes it to your mic/speakers
 ```
 
 `lk agent create` / `lk agent deploy` upload your build context to LiveKit Cloud, which creates
 billable resources on your LiveKit project. Confirm the target project before running them.
+
+### 5. Deploy from GitHub Actions (no local terminal needed)
+
+The workflow lives at **`.github/workflows/deploy.yml`**. It deploys the agent using the official
+[`livekit/deploy-action`](https://github.com/livekit/deploy-action), so no interactive
+`lk cloud auth` browser session is required.
+
+> **One-time setup step.** The copy committed here sits at `.github/deploy-workflow.yml`, because
+> the automation that prepared this branch runs as a GitHub App without the `workflows` permission
+> and so cannot write into `.github/workflows/`. Move it into place once:
+> open `.github/deploy-workflow.yml` on GitHub → **Edit** (pencil) → change the filename to
+> `.github/workflows/deploy.yml` → **Commit changes**. GitHub creates the folder automatically.
+> The file is inert until it lives under `.github/workflows/`.
+
+Add four **repository secrets** under *Settings → Secrets and variables → Actions → Repository
+secrets*:
+
+| Secret | Value |
+| --- | --- |
+| `LIVEKIT_URL` | `wss://<project>.livekit.cloud` |
+| `LIVEKIT_API_KEY` | LiveKit Cloud project API key |
+| `LIVEKIT_API_SECRET` | LiveKit Cloud project API secret |
+| `SECRET_LIST` | `PHONIC_API_KEY=<your phonic key>` (comma-separate extra pairs) |
+
+Then open *Actions → Deploy LiveKit Cloud Agent → Run workflow* and pick an operation:
+
+- **`create`** — registers a new LiveKit Cloud agent, builds the container and deploys it. Also
+  writes `livekit.toml` (which stores the project subdomain and the agent id — never a credential),
+  and the workflow commits that file back so later runs can find the agent. Run this first.
+- **`deploy`** — ships a new version of the existing agent. Requires `livekit.toml` in the repo.
+- **`status`** — only reads the current agent state.
+
+The workflow is **manual only** — there is no `push` or `pull_request` trigger, so nothing deploys
+by itself. All runs share one concurrency group, so two deployments can never race. It never prints
+secret values (it registers `::add-mask::` entries for the values inside `SECRET_LIST`, which
+GitHub masks automatically) and never writes a credential to a file.
 
 ---
 
@@ -305,6 +347,8 @@ billable resources on your LiveKit project. Confirm the target project before ru
 
 ```
 .env.example        Placeholder values for the four required variables
+.github/deploy-workflow.yml   Manual LiveKit Cloud deploy workflow (workflow_dispatch only).
+                              Move to .github/workflows/deploy.yml to activate - see section 10.5.
 .gitignore          Excludes .env and other secret-bearing files
 Dockerfile          Deployment image (Node 24, non-root, `npm start`) for LiveKit Cloud builds
 .dockerignore       Keeps tests, secrets and docs out of the build context
