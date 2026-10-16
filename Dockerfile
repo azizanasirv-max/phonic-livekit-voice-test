@@ -28,19 +28,18 @@ WORKDIR /app
 # Copy just the dependency files first, for more efficient layer caching
 COPY package.json package-lock.json ./
 
-# Install dependencies with npm ci for reproducible builds from the lockfile.
+# Install production dependencies from the lockfile with npm ci for reproducible
+# builds. --omit=dev skips dev-only packages (@types/node); TypeScript itself is
+# still pulled in transitively by @livekit/agents, and no build step is needed
+# because Node strips the TypeScript types when it runs the agent.
 # (This project uses npm + package-lock.json rather than the pnpm shown in the
 # LiveKit template; the rest of the template is unchanged.)
-RUN npm ci
+RUN npm ci --omit=dev
 
 # Copy all remaining application files into the container
 # This includes source code, configuration files, and dependency specifications
 # (Excludes files specified in .dockerignore)
 COPY . .
-
-# Remove dev dependencies (TypeScript, @types/node) for a leaner production image.
-# They are not needed at runtime because Node strips the TypeScript types itself.
-RUN npm prune --omit=dev
 
 # --- Production stage ---
 # Build tooling is not included in the final image.
