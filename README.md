@@ -216,8 +216,10 @@ interrupted too easily, or set it to `1` if it is too hard to interrupt.
 
 ## 9. Cost and deployment safeguards
 
-**No deployment is performed by this repository, and no billing settings are touched.** There is no
-CI, no Dockerfile, no deploy script, and no LiveKit Cloud deployment step.
+**Nothing is deployed automatically.** `.github/workflows/deploy.yml` is `workflow_dispatch`-only —
+it has no `push` and no `pull_request` trigger — so a deployment to LiveKit Cloud (the step that
+creates billable resources) only ever happens when a human explicitly starts a run. No billing
+settings are touched by this repository.
 
 Services that require credentials, and their cost characteristics:
 
@@ -237,11 +239,136 @@ its own Phonic key. Do not point it at a LiveKit project used by another product
 
 ---
 
-## 10. Files
+## 10. Deploy to LiveKit Cloud
+
+The agent deploys as a container built by the LiveKit Cloud build service, using the `Dockerfile`
+and `.dockerignore` in this repo (adapted from the official Node.js template at
+<https://docs.livekit.io/agents/ops/deployment/builds/>). The image uses **Node 24**, installs
+`ca-certificates` (required by the LiveKit SDK's native TLS stack), runs as an unprivileged
+`appuser`, and starts with `npm start`.
+
+### Prerequisites
+
+| Item | Where to get it |
+| --- | --- |
+| LiveKit CLI (`lk`) | <https://docs.livekit.io/reference/developer-tools/livekit-cli/> |
+| LiveKit project credentials | LiveKit Cloud dashboard → Project settings → Keys (`LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET`) |
+| Phonic key | Phonic console → API keys (`PHONIC_API_KEY`) |
+
+### 1. Authenticate
+
+```bash
+lk cloud auth          # interactive browser flow (recommended)
+```
+
+For a non-interactive environment, register the project with keys instead:
+
+```bash
+lk project add <name> --url wss://<project>.livekit.cloud \
+  --api-key "$LIVEKIT_API_KEY" --api-secret "$LIVEKIT_API_SECRET" --default
+```
+
+### 2. Create the agent (first deploy)
+
+`lk agent create` registers the agent, writes `livekit.toml`, builds the image, and deploys the
+first version. Secrets are read from a `.env.local` file (gitignored), or passed with `--secrets`.
+
+```bash
+cp .env.example .env.local      # then fill in the real values
+lk agent create --secrets-file .env.local
+```
+
+LiveKit Cloud injects `LIVEKIT_URL`, `LIVEKIT_API_KEY`, and `LIVEKIT_API_SECRET` automatically, so
+only `PHONIC_API_KEY` (and optional tuning values) strictly needs to be supplied as a secret.
+
+### 3. Subsequent deploys and monitoring
+
+```bash
+lk agent deploy                 # ship a new version
+lk agent status                 # deployment status
+lk agent logs                   # runtime logs
+lk agent secrets                # list secret names (values are never shown)
+```
+
+### 4. Talk to it
+
+For a **deployed** agent, open the **LiveKit Cloud dashboard → Agents → your agent → Console**
+and click **Start a session**, then use the microphone button. With `LIVEKIT_AGENT_NAME` unset the
+agent uses automatic dispatch, so it joins any new room in the project.
+
+To talk to the agent **locally** instead (needs a local `.env`, not a deployment):
+
+```bash
+lk agent console                # runs the agent on your machine and pipes it to your mic/speakers
+```
+
+`lk agent create` / `lk agent deploy` upload your build context to LiveKit Cloud, which creates
+billable resources on your LiveKit project. Confirm the target project before running them.
+
+### 5. Deploy from GitHub Actions (no local terminal needed)
+
+The workflow lives at **`.github/workflows/deploy.yml`**. It deploys the agent using the official
+[`livekit/deploy-action`](https://github.com/livekit/deploy-action), so no interactive
+`lk cloud auth` browser session is required.
+
+> **One-time setup step.** The copy committed here sits at `.github/deploy-workflow.yml`, because
+> the automation that prepared this branch runs as a GitHub App without the `workflows` permission
+> and so cannot write into `.github/workflows/`. Move it into place once:
+> open `.github/deploy-workflow.yml` on GitHub → **Edit** (pencil) → change the filename to
+> `.github/workflows/deploy.yml` → **Commit changes**. GitHub creates the folder automatically.
+> The file is inert until it lives under `.github/workflows/`.
+>
+> **The workflow must end up on the default branch.** GitHub only shows the *Run workflow* button
+> when the workflow file exists on the default branch, and the run deploys whatever branch you
+> select. This branch is the one that also carries `Dockerfile` and `.dockerignore`, so merge it
+> (see *Open the pull request* below) rather than adding the workflow to the default branch on its
+> own — otherwise the deployment fails the "required deployment files exist" check.
+
+### 6. Open the pull request
+
+The default branch of this repository is `cline/afhrhgja`, which does **not** yet contain the
+`Dockerfile`, `.dockerignore`, or this workflow. Bring them over with a pull request:
+
+1. Open <https://github.com/azizanasirv-max/phonic-livekit-voice-test/pull/new/cline/chxv51c3>
+   (base `cline/afhrhgja` ← compare `cline/chxv51c3`).
+2. Click **Create pull request**, then **Merge pull request**.
+
+After the merge the default branch holds everything the deployment needs.
+
+Add four **repository secrets** under *Settings → Secrets and variables → Actions → Repository
+secrets*:
+
+| Secret | Value |
+| --- | --- |
+| `LIVEKIT_URL` | `wss://<project>.livekit.cloud` |
+| `LIVEKIT_API_KEY` | LiveKit Cloud project API key |
+| `LIVEKIT_API_SECRET` | LiveKit Cloud project API secret |
+| `SECRET_LIST` | `PHONIC_API_KEY=<your phonic key>` (comma-separate extra pairs) |
+
+Then open *Actions → Deploy LiveKit Cloud Agent → Run workflow* and pick an operation:
+
+- **`create`** — registers a new LiveKit Cloud agent, builds the container and deploys it. Also
+  writes `livekit.toml` (which stores the project subdomain and the agent id — never a credential),
+  and the workflow commits that file back so later runs can find the agent. Run this first.
+- **`deploy`** — ships a new version of the existing agent. Requires `livekit.toml` in the repo.
+- **`status`** — only reads the current agent state.
+
+The workflow is **manual only** — there is no `push` or `pull_request` trigger, so nothing deploys
+by itself. All runs share one concurrency group, so two deployments can never race. It never prints
+secret values (it registers `::add-mask::` entries for the values inside `SECRET_LIST`, which
+GitHub masks automatically) and never writes a credential to a file.
+
+---
+
+## 11. Files
 
 ```
 .env.example        Placeholder values for the four required variables
+.github/deploy-workflow.yml   Manual LiveKit Cloud deploy workflow (workflow_dispatch only).
+                              Move to .github/workflows/deploy.yml to activate - see section 10.5.
 .gitignore          Excludes .env and other secret-bearing files
+Dockerfile          Deployment image (Node 24, non-root, `npm start`) for LiveKit Cloud builds
+.dockerignore       Keeps tests, secrets and docs out of the build context
 package.json        Dependencies and scripts
 tsconfig.json       Type-check configuration (NodeNext, strict, no emit)
 src/main.ts         Agent entry point: defineAgent + AgentSession + Phonic model + cli.runApp
@@ -256,7 +383,7 @@ tests/*.test.ts     Unit tests (no network, no paid calls)
 
 ---
 
-## 11. Unresolved questions
+## 12. Unresolved questions
 
 1. **Exact Phonic billing granularity** — pricing is published per minute, but per-second rounding,
    minimum session length, and whether a failed/no-audio session is billed are not documented on the

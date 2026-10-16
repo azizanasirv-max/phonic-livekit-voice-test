@@ -1,0 +1,281 @@
+# Deploy the existing Phonic + LiveKit TypeScript agent to LiveKit Cloud.
+#
+# Uses the official LiveKit action:
+#   https://github.com/livekit/deploy-action
+#
+# This workflow is MANUAL ONLY. It has no `push` and no `pull_request`
+# trigger, so nothing is ever deployed to LiveKit Cloud unless a human
+# explicitly starts a run from the Actions tab.
+#
+# Required repository secrets (Settings -> Secrets and variables -> Actions):
+#   LIVEKIT_URL        wss://<project>.livekit.cloud
+#   LIVEKIT_API_KEY    LiveKit Cloud project API key
+#   LIVEKIT_API_SECRET LiveKit Cloud project API secret
+#   SECRET_LIST        PHONIC_API_KEY=<your phonic key>
+#
+# Secret values are never printed and never written into the repository.
+name: Deploy LiveKit Cloud Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      operation:
+        description: >-
+          "create" registers a new LiveKit Cloud agent and deploys it (also
+          writes livekit.toml). "deploy" ships a new version of the existing
+          agent. "status" only reads the agent's current state.
+        required: true
+        type: choice
+        options:
+          - create
+          - deploy
+          - status
+        default: create
+      region:
+        description: >-
+          Optional LiveKit Cloud region (for example "us-east"). Leave empty to
+          let LiveKit pick the nearest region.
+        required: false
+        type: string
+        default: ""
+
+# One fixed group for every run, so two deployments to the same LiveKit Cloud
+# agent can never race. Runs queue behind each other. cancel-in-progress is
+# deliberately false: cancelling a run halfway through a container build or
+# deploy could leave the agent in a partially updated state.
+concurrency:
+  group: livekit-cloud-agent-deploy
+  cancel-in-progress: false
+
+# `contents: write` is used only by the "Commit generated livekit.toml" step.
+permissions:
+  contents: write
+
+jobs:
+  livekit:
+    name: ${{ inputs.operation }} LiveKit Cloud agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          # Keep the token so the generated livekit.toml can be pushed back.
+          persist-credentials: true
+
+      # GitHub masks `secrets.*` values automatically, but the individual
+      # KEY=VALUE pairs inside SECRET_LIST are not masked. Register each value
+      # with ::add-mask:: so it can never appear in a log. The runner consumes
+      # ::add-mask:: lines without echoing them.
+      - name: Mask secret values
+        env:
+          SECRET_LIST: ${{ secrets.SECRET_LIST }}
+        run: |
+          set -euo pipefail
+          IFS=',' read -r -a pairs <<< "${SECRET_LIST:-}"
+          for pair in "${pairs[@]}"; do
+            [ -n "$pair" ] || continue
+            value="${pair#*=}"
+            if [ -n "$value" ]; then
+              echo "::add-mask::$value"
+            fi
+          done
+
+      - name: Verify required deployment files exist
+        run: |
+          set -euo pipefail
+          missing=0
+          for file in package.json package-lock.json Dockerfile .dockerignore src/main.ts; do
+            if [ -f "$file" ]; then
+              echo "Found $file"
+            else
+              echo "::error::Required deployment file is missing: $file"
+              missing=1
+            fi
+          done
+          if [ "$missing" -ne 0 ]; then
+            echo "::error::Refusing to deploy: the build context is incomplete."
+            exit 1
+          fi
+
+      # Only variable names are ever printed here, never values.
+      - name: Verify required repository secrets
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          SECRET_LIST: ${{ secrets.SECRET_LIST }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${LIVEKIT_URL:-}" ] || missing+=("LIVEKIT_URL")
+          [ -n "${LIVEKIT_API_KEY:-}" ] || missing+=("LIVEKIT_API_KEY")
+          [ -n "${LIVEKIT_API_SECRET:-}" ] || missing+=("LIVEKIT_API_SECRET")
+          [ -n "${SECRET_LIST:-}" ] || missing+=("SECRET_LIST")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required repository secret(s): ${missing[*]}. Add them under Settings -> Secrets and variables -> Actions -> Repository secrets."
+            exit 1
+          fi
+          echo "All four required repository secrets are present."
+
+          # Fail early on a URL that can never reach LiveKit Cloud. Only the
+          # scheme is inspected; the URL itself is never printed.
+          case "$LIVEKIT_URL" in
+            wss://*) : ;;
+            http://*|https://*)
+              echo "::error::LIVEKIT_URL must be a WebSocket URL (wss://<project>.livekit.cloud), not HTTP(S)."
+              exit 1
+              ;;
+            *)
+              echo "::warning::LIVEKIT_URL does not start with wss:// - LiveKit Cloud expects wss://<project>.livekit.cloud."
+              ;;
+          esac
+
+          # The agent needs PHONIC_API_KEY at runtime; without it every session
+          # fails. Only the secret name is reported.
+          case "$SECRET_LIST" in
+            *PHONIC_API_KEY=*)
+              echo "SECRET_LIST provides PHONIC_API_KEY."
+              ;;
+            *)
+              echo "::error::SECRET_LIST must contain PHONIC_API_KEY=<your key> in KEY=value form."
+              exit 1
+              ;;
+          esac
+
+      # livekit.toml stores the LiveKit agent id. "create" writes it; "deploy"
+      # and "status" read it. Catching a mismatch here gives a clear error
+      # instead of a confusing failure inside the action.
+      - name: Preflight livekit.toml
+        env:
+          OPERATION: ${{ inputs.operation }}
+        run: |
+          set -euo pipefail
+          if [ -f livekit.toml ]; then
+            echo "livekit.toml is present in the repository."
+            if [ "$OPERATION" = "create" ]; then
+              echo "::warning::livekit.toml already exists, so the LiveKit 'create' operation is a no-op and will NOT ship a new version. Use the 'deploy' operation to ship changes."
+            fi
+          else
+            echo "livekit.toml is not present in the repository."
+            if [ "$OPERATION" != "create" ]; then
+              echo "::error::The '$OPERATION' operation requires livekit.toml, which stores the LiveKit agent id. Run this workflow with operation 'create' first and commit the generated livekit.toml."
+              exit 1
+            fi
+          fi
+
+      - name: Run LiveKit Cloud agent operation
+        id: livekit
+        uses: livekit/deploy-action@v2.12.2
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          SECRET_LIST: ${{ secrets.SECRET_LIST }}
+        with:
+          OPERATION: ${{ inputs.operation }}
+          WORKING_DIRECTORY: "."
+          REGION: ${{ inputs.region }}
+
+      # Defence in depth: livekit.toml is generated by the action and should
+      # only ever contain the project subdomain and the agent id. Verify that
+      # before it is committed anywhere.
+      - name: Guard generated livekit.toml against credential leakage
+        if: ${{ inputs.operation == 'create' }}
+        env:
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          SECRET_LIST: ${{ secrets.SECRET_LIST }}
+        run: |
+          set -euo pipefail
+          if [ ! -f livekit.toml ]; then
+            echo "::notice::livekit.toml was not generated, so there is nothing to check."
+            exit 0
+          fi
+          status=0
+          check_value() {
+            local name="$1"
+            local value="$2"
+            if [ -n "$value" ] && grep -qF -- "$value" livekit.toml; then
+              echo "::error::livekit.toml appears to contain the value of $name."
+              status=1
+            fi
+          }
+          check_value LIVEKIT_API_SECRET "${LIVEKIT_API_SECRET:-}"
+          IFS=',' read -r -a pairs <<< "${SECRET_LIST:-}"
+          for pair in "${pairs[@]}"; do
+            [ -n "$pair" ] || continue
+            check_value "${pair%%=*}" "${pair#*=}"
+          done
+          if [ "$status" -ne 0 ]; then
+            echo "::error::Refusing to commit livekit.toml because it contains secret material. Inspect it manually."
+            exit 1
+          fi
+          echo "livekit.toml contains no secret values."
+
+      # Persist livekit.toml so later "deploy" runs know the agent id. The file
+      # holds only the project subdomain and the agent id - never a credential.
+      - name: Commit generated livekit.toml
+        id: persist
+        if: ${{ inputs.operation == 'create' }}
+        env:
+          BRANCH: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [ ! -f livekit.toml ]; then
+            echo "::notice::No livekit.toml was generated, so there is nothing to commit."
+            exit 0
+          fi
+          if git ls-files --error-unmatch livekit.toml >/dev/null 2>&1; then
+            echo "::notice::livekit.toml is already tracked; nothing to commit."
+            exit 0
+          fi
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add livekit.toml
+          git commit -m "Add LiveKit Cloud agent config (livekit.toml)"
+          git push origin "HEAD:$BRANCH"
+          echo "Committed livekit.toml so future 'deploy' runs can resolve the agent id."
+
+      # Safety net in case the push above is rejected (for example by branch
+      # protection): the generated config is still downloadable from the run.
+      - name: Upload livekit.toml artifact
+        if: ${{ always() && inputs.operation == 'create' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: livekit-toml
+          path: livekit.toml
+          if-no-files-found: ignore
+
+      - name: Report result
+        if: always()
+        env:
+          OPERATION: ${{ inputs.operation }}
+          LIVEKIT_OUTCOME: ${{ steps.livekit.outcome }}
+          PERSIST_OUTCOME: ${{ steps.persist.outcome }}
+          REGION: ${{ inputs.region }}
+          BRANCH: ${{ github.ref_name }}
+          COMMIT: ${{ github.sha }}
+        run: |
+          set -euo pipefail
+          report="## LiveKit Cloud agent: \`$OPERATION\`
+
+          | Item | Result |
+          | --- | --- |
+          | LiveKit deploy-action outcome | \`$LIVEKIT_OUTCOME\` |
+          | livekit.toml commit outcome | \`$PERSIST_OUTCOME\` |
+          | Branch | \`$BRANCH\` |
+          | Commit | \`$COMMIT\` |
+          | Region | \`$REGION\` |
+          "
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' "$report"
+          fi
+          if [ "$LIVEKIT_OUTCOME" != "success" ]; then
+            echo "::error::The LiveKit '$OPERATION' operation did not succeed. See the step log above."
+            exit 1
+          fi
+          echo "LiveKit '$OPERATION' reported success."
+
