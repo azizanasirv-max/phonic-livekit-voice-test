@@ -1,0 +1,122 @@
+/**
+ * Environment-variable handling for the Phonic + LiveKit voice prototype.
+ *
+ * All `process.env` access goes through this module so that:
+ *  - required variables are validated in one place with friendly messages, and
+ *  - credentials can be redacted before anything is written to a log.
+ */
+
+/** Variables the agent needs before it can start a voice session. */
+export const REQUIRED_ENV_VARS = [
+  'PHONIC_API_KEY',
+  'LIVEKIT_URL',
+  'LIVEKIT_API_KEY',
+  'LIVEKIT_API_SECRET',
+] as const;
+
+export type RequiredEnvVar = (typeof REQUIRED_ENV_VARS)[number];
+
+/** Variables whose values are secrets and must never be logged verbatim. */
+export const SECRET_ENV_VARS = [
+  'PHONIC_API_KEY',
+  'LIVEKIT_API_KEY',
+  'LIVEKIT_API_SECRET',
+] as const;
+
+export type EnvLike = Record<string, string | undefined>;
+
+/** Thrown when required configuration is missing or malformed. */
+export class ConfigError extends Error {
+  readonly missing: RequiredEnvVar[];
+
+  constructor(message: string, missing: RequiredEnvVar[] = []) {
+    super(message);
+    this.name = 'ConfigError';
+    this.missing = missing;
+  }
+}
+
+/** Read a variable, treating empty/whitespace-only values as unset. */
+export function readEnv(name: string, env: EnvLike = process.env): string | undefined {
+  const raw = env[name];
+  if (raw === undefined) return undefined;
+  const trimmed = raw.trim();
+  return trimmed === '' ? undefined : trimmed;
+}
+
+/** Names of required variables that are missing or blank. */
+export function getMissingEnvVars(
+  env: EnvLike = process.env,
+  vars: readonly RequiredEnvVar[] = REQUIRED_ENV_VARS,
+): RequiredEnvVar[] {
+  return vars.filter((name) => readEnv(name, env) === undefined);
+}
+
+/**
+ * Throw a {@link ConfigError} listing every missing required variable.
+ * Values are never included in the message.
+ */
+export function assertRequiredEnv(
+  env: EnvLike = process.env,
+  vars: readonly RequiredEnvVar[] = REQUIRED_ENV_VARS,
+): void {
+  const missing = getMissingEnvVars(env, vars);
+  if (missing.length > 0) {
+    throw new ConfigError(
+      `Missing required environment variable(s): ${missing.join(', ')}. ` +
+        'Copy .env.example to .env and fill in the values (see README.md).',
+      missing,
+    );
+  }
+}
+
+/** Render a credential so you can confirm it is set without revealing it. */
+export function maskSecret(value?: string): string {
+  if (value === undefined || value.trim() === '') return '(not set)';
+  if (value.length <= 8) return '****';
+  return `${value.slice(0, 4)}…${value.slice(-4)}`;
+}
+
+/** Masked view of the environment, safe to log at startup. */
+export function safeEnvSummary(env: EnvLike = process.env): Record<string, string> {
+  return {
+    PHONIC_API_KEY: maskSecret(readEnv('PHONIC_API_KEY', env)),
+    LIVEKIT_URL: readEnv('LIVEKIT_URL', env) ?? '(not set)',
+    LIVEKIT_API_KEY: maskSecret(readEnv('LIVEKIT_API_KEY', env)),
+    LIVEKIT_API_SECRET: maskSecret(readEnv('LIVEKIT_API_SECRET', env)),
+    PHONIC_VOICE: readEnv('PHONIC_VOICE', env) ?? '(not set)',
+    PHONIC_MIN_WORDS_TO_INTERRUPT: readEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', env) ?? '(not set)',
+    LIVEKIT_AGENT_NAME: readEnv('LIVEKIT_AGENT_NAME', env) ?? '(not set)',
+  };
+}
+
+/** Every configured secret value, longest first (so overlaps redact cleanly). */
+export function secretValues(env: EnvLike = process.env): string[] {
+  return SECRET_ENV_VARS.map((name) => readEnv(name, env))
+    .filter((value): value is string => value !== undefined)
+    .sort((a, b) => b.length - a.length);
+}
+
+/**
+ * Replace any configured credential appearing in `text` with its masked form.
+ * Used for anything that may end up in a log or a crash report.
+ */
+export function redactSecrets(text: string, env: EnvLike = process.env): string {
+  let result = text;
+  for (const secret of secretValues(env)) {
+    result = result.split(secret).join(maskSecret(secret));
+  }
+  return result;
+}
+
+/** Parse an integer env override, falling back to `fallback` when unset/invalid. */
+export function readIntEnv(
+  name: string,
+  fallback: number,
+  env: EnvLike = process.env,
+): number {
+  const raw = readEnv(name, env);
+  if (raw === undefined) return fallback;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}

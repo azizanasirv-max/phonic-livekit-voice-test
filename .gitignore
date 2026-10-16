@@ -1,0 +1,27 @@
+# --- Secrets: never commit these ---
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Dependencies / build output ---
+node_modules/
+dist/
+build/
+*.tsbuildinfo
+
+# --- Logs and local artifacts ---
+*.log
+.tmp/
+npm-debug.log*
+pnpm-debug.log*
+yarn-error.log*
+coverage/
+.nyc_output/
+
+# --- Editor / OS noise ---
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
