@@ -12,7 +12,8 @@ import { type JobContext, ServerOptions, cli, defineAgent, voice } from '@liveki
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { createAgent } from './agent.ts';
-import { assertRequiredEnv, readEnv, safeEnvSummary } from './config.ts';
+import { assertRequiredEnv, readEnv, resolveDiagnosticsOptions, safeEnvSummary } from './config.ts';
+import { createSessionDiagnostics, newSessionId } from './diagnostics.ts';
 import { GREETING_INSTRUCTIONS } from './instructions.ts';
 import { describeError, logError, logInfo, logWarn } from './logging.ts';
 import { createRealtimeModel, resolvePhonicOptions } from './phonic.ts';
@@ -44,6 +45,41 @@ export default defineAgent({
       }),
     });
 
+    // --- Stage 0 diagnostics (opt-in via DIAG_* env flags) ---
+    // Read-only instrumentation: a per-turn event timeline and WebRTC statistics
+    // snapshots. Disabled by default, and records metadata only — never
+    // credentials, raw audio, or transcript content. It does not change turn
+    // detection, interruption handling, buffering, or model configuration.
+    const diagOptions = resolveDiagnosticsOptions(process.env);
+    const diagnostics = createSessionDiagnostics({
+      sessionId: newSessionId(),
+      session,
+      eventNames: {
+        userStateChanged: voice.AgentSessionEventTypes.UserStateChanged,
+        agentStateChanged: voice.AgentSessionEventTypes.AgentStateChanged,
+        speechCreated: voice.AgentSessionEventTypes.SpeechCreated,
+        conversationItemAdded: voice.AgentSessionEventTypes.ConversationItemAdded,
+        error: voice.AgentSessionEventTypes.Error,
+        close: voice.AgentSessionEventTypes.Close,
+      },
+      timeline: diagOptions.timeline,
+      rtc: diagOptions.rtcStats
+        ? { source: ctx.room, intervalMs: diagOptions.rtcIntervalMs }
+        : undefined,
+    });
+    if (diagOptions.timeline || diagOptions.rtcStats) {
+      logInfo('diagnostics enabled', {
+        sessionId: diagnostics.sessionId,
+        timeline: diagOptions.timeline,
+        rtcStats: diagOptions.rtcStats,
+        rtcIntervalMs: diagOptions.rtcIntervalMs,
+      });
+    }
+    // Stop sampling when the session ends (covers disconnect and shutdown).
+    session.on(voice.AgentSessionEventTypes.Close, () => {
+      void diagnostics.stop();
+    });
+
     // Surface session-level problems (connection drops, provider errors) with
     // redacted messages instead of letting them fail silently.
     session.on(voice.AgentSessionEventTypes.Error, (event) => {
@@ -58,6 +94,9 @@ export default defineAgent({
     // Join the room, then speak first.
     await ctx.connect();
     logInfo('agent connected to room', { room: ctx.room.name });
+
+    // Begin RTC sampling now that the room is connected (no-op when disabled).
+    diagnostics.startRtcSampling();
 
     await session.generateReply({ instructions: GREETING_INSTRUCTIONS });
   },

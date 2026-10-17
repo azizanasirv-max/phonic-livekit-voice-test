@@ -87,6 +87,9 @@ export function safeEnvSummary(env: EnvLike = process.env): Record<string, strin
     PHONIC_VOICE: readEnv('PHONIC_VOICE', env) ?? '(not set)',
     PHONIC_MIN_WORDS_TO_INTERRUPT: readEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', env) ?? '(not set)',
     LIVEKIT_AGENT_NAME: readEnv('LIVEKIT_AGENT_NAME', env) ?? '(not set)',
+    DIAG_TURN_TIMELINE: readEnv('DIAG_TURN_TIMELINE', env) ?? '(not set)',
+    DIAG_RTC_STATS: readEnv('DIAG_RTC_STATS', env) ?? '(not set)',
+    DIAG_RTC_INTERVAL_MS: readEnv('DIAG_RTC_INTERVAL_MS', env) ?? '(not set)',
   };
 }
 
@@ -119,6 +122,59 @@ export function readIntEnv(
   if (raw === undefined) return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/** Values that read as "on" / "off" for boolean env flags. */
+const TRUTHY = new Set(['1', 'true', 'yes', 'on']);
+const FALSY = new Set(['0', 'false', 'no', 'off']);
+
+/**
+ * Parse a boolean env flag, falling back to `fallback` when unset/unrecognized.
+ * Diagnostics are disabled by default; only an explicit truthy value enables them.
+ */
+export function readBoolEnv(
+  name: string,
+  fallback = false,
+  env: EnvLike = process.env,
+): boolean {
+  const raw = readEnv(name, env);
+  if (raw === undefined) return fallback;
+  const normalized = raw.toLowerCase();
+  if (TRUTHY.has(normalized)) return true;
+  if (FALSY.has(normalized)) return false;
+  return fallback;
+}
+
+/** Resolved diagnostics configuration (Stage 0). Never contains credentials. */
+export type DiagnosticsOptions = {
+  /** Record the per-turn event timeline. Off by default. */
+  timeline: boolean;
+  /** Sample `room.getRtcStats()`. Off by default. */
+  rtcStats: boolean;
+  /** RTC sampling interval in milliseconds (clamped). */
+  rtcIntervalMs: number;
+};
+
+/** Minimum accepted `DIAG_RTC_INTERVAL_MS` (avoids hammering the FFI/stats path). */
+export const MIN_RTC_INTERVAL_MS = 1000;
+/** Maximum accepted `DIAG_RTC_INTERVAL_MS`. */
+export const MAX_RTC_INTERVAL_MS = 60000;
+/** Default `DIAG_RTC_INTERVAL_MS`. */
+export const DEFAULT_RTC_INTERVAL_MS = 5000;
+
+/**
+ * Resolve the Stage 0 diagnostics flags. Everything is opt-in: with none of the
+ * `DIAG_*` variables set, diagnostics are fully disabled and the agent behaves
+ * exactly as before.
+ */
+export function resolveDiagnosticsOptions(env: EnvLike = process.env): DiagnosticsOptions {
+  const requested = readIntEnv('DIAG_RTC_INTERVAL_MS', DEFAULT_RTC_INTERVAL_MS, env);
+  const rtcIntervalMs = Math.min(MAX_RTC_INTERVAL_MS, Math.max(MIN_RTC_INTERVAL_MS, requested));
+  return {
+    timeline: readBoolEnv('DIAG_TURN_TIMELINE', false, env),
+    rtcStats: readBoolEnv('DIAG_RTC_STATS', false, env),
+    rtcIntervalMs,
+  };
 }
 
 /** Hostnames that mean "a LiveKit server running locally". */
