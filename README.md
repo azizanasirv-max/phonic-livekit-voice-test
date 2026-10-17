@@ -149,7 +149,7 @@ npm run typecheck   # must pass cleanly
 npm test
 ```
 
-`npm test` runs 27 unit tests in three files. **None of them make network requests or call a paid
+`npm test` runs 46 unit tests in four files. **None of them make network requests or call a paid
 API:**
 
 | File | Covers |
@@ -157,6 +157,7 @@ API:**
 | `tests/config.test.ts` | Env validation, missing-variable reporting, credential masking/redaction, `LIVEKIT_URL` scheme validation |
 | `tests/instructions.test.ts` | The prompt is concise and contains the interruption/backchannel rules |
 | `tests/phonic.test.ts` | The Phonic model is constructed with the documented options and fails cleanly without a key |
+| `tests/diagnostics.test.ts` | Stage 0 instrumentation: RTC-stat extraction/summary, sampler scheduling/errors/shutdown, timeline turn ids and privacy, and the disabled-by-default flags |
 
 There is **no automated end-to-end voice test**: verifying real audio requires a paid Phonic
 conversation plus a human microphone, so it stays manual (section 8).
@@ -166,7 +167,7 @@ conversation plus a human microphone, so it stays manual (section 8).
 | Check | Command | Result |
 | --- | --- | --- |
 | Type check | `npm run typecheck` | ✅ 0 errors |
-| Unit tests | `npm test` | ✅ 27 passed / 0 failed |
+| Unit tests | `npm test` | ✅ 46 passed / 0 failed |
 | Agent boots | `node src/main.ts dev` | ✅ Worker starts, binds a random port, then retries the LiveKit connection |
 | Connection error path | `node src/main.ts dev` with an unreachable `LIVEKIT_URL` | ✅ Clear `failed to connect to LiveKit server (ws://127.0.0.1:7880), retrying in 2 seconds: (1/10)` messages |
 | Missing config path | `npm run check:env` with no `.env` | ✅ Exits `1` with `Missing required environment variable(s): PHONIC_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET` |
@@ -378,12 +379,85 @@ src/instructions.ts Agent prompt (concise, interruption/backchannel aware)
 src/config.ts       Env reading, validation, masking, redaction
 src/logging.ts      Redacted console logging helpers
 src/check-env.ts    `npm run check:env` preflight check
+src/diagnostics.ts  Stage 0 diagnostics (opt-in): turn timeline + RTC stats
 tests/*.test.ts     Unit tests (no network, no paid calls)
 ```
 
 ---
 
-## 12. Unresolved questions
+## 12. Diagnostics (Stage 0, opt-in)
+
+Read-only instrumentation for diagnosing latency, glitches, and turn-taking. It
+records timing metadata and WebRTC statistics only — **never** credentials, raw
+audio, or transcript content — and does not change turn detection, interruption
+handling, buffering, model configuration, authentication, or session isolation.
+Everything is **disabled by default**.
+
+| Variable | Default | Effect |
+| --- | --- | --- |
+| `DIAG_TURN_TIMELINE` | unset (off) | Log a per-turn event timeline |
+| `DIAG_RTC_STATS` | unset (off) | Sample agent-side WebRTC statistics |
+| `DIAG_RTC_INTERVAL_MS` | `5000` | Sampling interval, clamped to `1000`–`60000` |
+
+With all three unset the agent behaves exactly as before; the only extra output
+is the masked `DIAG_*` lines in the startup summary.
+
+### What is recorded
+
+**Turn timeline** (`diag: <event>` lines, each with `sessionId`, `turn`, `t`
+monotonic ms, `wallMs` epoch ms):
+
+- `user_speech_started` / `user_speech_stopped` — user state transitions.
+- `agent_speaking_started` / `agent_speaking_ended` — agent state transitions,
+  with `agentSpeakingMs`.
+- `agent_state` / `user_state` — other state transitions.
+- `speech_created` — `source`, `userInitiated`, `speechId`.
+- `conversation_item` — `role`, `itemId`, `interrupted` (metadata only).
+- `session_error` — redacted error description.
+- `session_closed` — close reason.
+
+> **Proxy, not ground truth:** `agent_speaking_started` carries
+> `endOfUserSpeechToAgentSpeakingMs` and `latencyKind: "proxy"`. Agent state
+> "speaking" means the agent began emitting audio; it does **not** prove a frame
+> was played on the phone.
+
+**RTC statistics** (`diag: rtc_stats` lines) come from the verified
+`room.getRtcStats()` API and cover the agent's peer connection: inbound/outbound
+audio `packetsReceived`/`packetsSent`, `packetsLost`, `jitter`,
+`jitterBufferDelay` (average, ms), `nackCount`,
+`retransmittedPacketsReceived/Sent`, `concealedSamples`, `concealmentEvents`,
+`framesDropped`, `roundTripTime` (ms), and ICE/DTLS/candidate-pair state.
+libwebrtc reports jitter, jitter-buffer delay, and RTT in **seconds**; the
+summary converts them to milliseconds. Sampling errors (e.g. room not connected)
+are caught and rate-limited, not fatal.
+
+### Enabling it for one session
+
+```bash
+# Local run
+DIAG_TURN_TIMELINE=1 DIAG_RTC_STATS=1 npm run dev
+
+# Deployed agent: add the same variables as LiveKit Cloud agent secrets, or
+# export them before `lk agent deploy`. Never put real credentials in a file
+# you commit.
+```
+
+Correlate with server-side logs using `sessionId` (a short, non-secret id) plus
+`wallMs`; use `t` (monotonic) for elapsed-time math within a session, since the
+agent's and the phone's wall clocks differ.
+
+### What this does not measure
+
+- First **audible** audio on the phone (no client-side playback instrumentation;
+  Phonic emits no `realtime_model_metrics`, so there is no time-to-first-audio
+  metric).
+- Phone-side WebRTC statistics (only the agent peer connection is sampled).
+- Phonic socket internals (the installed plugin does not expose them; nothing is
+  monkey-patched).
+
+---
+
+## 13. Unresolved questions
 
 1. **Exact Phonic billing granularity** — pricing is published per minute, but per-second rounding,
    minimum session length, and whether a failed/no-audio session is billed are not documented on the
