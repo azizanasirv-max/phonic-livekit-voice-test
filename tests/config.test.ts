@@ -11,6 +11,7 @@ import {
   maskSecret,
   readEnv,
   readIntEnv,
+  readOptionalFloatEnv,
   readOptionalIntEnv,
   redactSecrets,
   safeEnvSummary,
@@ -19,7 +20,9 @@ import {
 
 /** A complete, fake environment. Values here are obviously not real keys. */
 const FULL_ENV: Record<string, string> = {
-  PHONIC_API_KEY: 'ph_test_0000000000000000',
+  DEEPSLATE_VENDOR_ID: 'vendor_0000000000000000',
+  DEEPSLATE_ORGANIZATION_ID: 'org_0000000000000000',
+  DEEPSLATE_API_KEY: 'ds_test_0000000000000000',
   LIVEKIT_URL: 'wss://example.livekit.cloud',
   LIVEKIT_API_KEY: 'API0000000000000',
   LIVEKIT_API_SECRET: 'secret_0000000000000000',
@@ -38,19 +41,21 @@ function captureConfigError(fn: () => void): ConfigError {
 
 describe('readEnv', () => {
   it('returns undefined for missing and blank values', () => {
-    assert.equal(readEnv('PHONIC_API_KEY', {}), undefined);
-    assert.equal(readEnv('PHONIC_API_KEY', { PHONIC_API_KEY: '   ' }), undefined);
+    assert.equal(readEnv('DEEPSLATE_API_KEY', {}), undefined);
+    assert.equal(readEnv('DEEPSLATE_API_KEY', { DEEPSLATE_API_KEY: '   ' }), undefined);
   });
 
   it('trims surrounding whitespace', () => {
-    assert.equal(readEnv('PHONIC_VOICE', { PHONIC_VOICE: ' sabrina ' }), 'sabrina');
+    assert.equal(readEnv('DEEPSLATE_MODEL', { DEEPSLATE_MODEL: ' opal-v2.1 ' }), 'opal-v2.1');
   });
 });
 
 describe('getMissingEnvVars / assertRequiredEnv', () => {
   it('reports every missing variable when the environment is empty', () => {
     assert.deepEqual(getMissingEnvVars({}), [
-      'PHONIC_API_KEY',
+      'DEEPSLATE_VENDOR_ID',
+      'DEEPSLATE_ORGANIZATION_ID',
+      'DEEPSLATE_API_KEY',
       'LIVEKIT_URL',
       'LIVEKIT_API_KEY',
       'LIVEKIT_API_SECRET',
@@ -63,20 +68,20 @@ describe('getMissingEnvVars / assertRequiredEnv', () => {
   });
 
   it('throws a ConfigError naming the missing variables but no values', () => {
-    const error = captureConfigError(() => assertRequiredEnv({ ...FULL_ENV, PHONIC_API_KEY: '' }));
+    const error = captureConfigError(() => assertRequiredEnv({ ...FULL_ENV, DEEPSLATE_API_KEY: '' }));
 
-    assert.deepEqual(error.missing, ['PHONIC_API_KEY']);
-    assert.match(error.message, /PHONIC_API_KEY/);
-    assert.doesNotMatch(error.message, /ph_test/);
+    assert.deepEqual(error.missing, ['DEEPSLATE_API_KEY']);
+    assert.match(error.message, /DEEPSLATE_API_KEY/);
+    assert.doesNotMatch(error.message, /ds_test/);
     assert.match(error.message, /\.env\.example/);
   });
 });
 
 describe('maskSecret', () => {
   it('never reveals the middle of a credential', () => {
-    const masked = maskSecret('ph_test_0000000000000000');
+    const masked = maskSecret('ds_test_0000000000000000');
     assert.ok(!masked.includes('0000000000'));
-    assert.equal(masked, 'ph_t…0000');
+    assert.equal(masked, 'ds_t…0000');
   });
 
   it('fully hides short values and labels unset values', () => {
@@ -88,10 +93,10 @@ describe('maskSecret', () => {
 
 describe('redactSecrets', () => {
   it('removes every configured credential from arbitrary text', () => {
-    const text = `connect failed for key ${FULL_ENV.PHONIC_API_KEY} using ${FULL_ENV.LIVEKIT_API_SECRET}`;
+    const text = `connect failed for key ${FULL_ENV.DEEPSLATE_API_KEY} using ${FULL_ENV.LIVEKIT_API_SECRET}`;
     const redacted = redactSecrets(text, FULL_ENV);
 
-    assert.doesNotMatch(redacted, /ph_test_0000000000000000/);
+    assert.doesNotMatch(redacted, /ds_test_0000000000000000/);
     assert.doesNotMatch(redacted, /secret_0000000000000000/);
     assert.match(redacted, /connect failed/);
   });
@@ -105,7 +110,7 @@ describe('safeEnvSummary', () => {
   it('contains no raw secret values', () => {
     const summary = JSON.stringify(safeEnvSummary(FULL_ENV));
 
-    assert.doesNotMatch(summary, /ph_test_0000000000000000/);
+    assert.doesNotMatch(summary, /ds_test_0000000000000000/);
     assert.doesNotMatch(summary, /secret_0000000000000000/);
     // The non-secret URL is fine to show.
     assert.match(summary, /wss:\/\/example\.livekit\.cloud/);
@@ -114,25 +119,50 @@ describe('safeEnvSummary', () => {
 
 describe('readIntEnv', () => {
   it('parses integers and falls back on unset/invalid/negative values', () => {
-    assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, {}), 2);
-    assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: '4' }), 4);
-    assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: 'abc' }), 2);
-    assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: '-1' }), 2);
+    assert.equal(readIntEnv('DEEPSLATE_VAD_START_MS', 150, {}), 150);
+    assert.equal(readIntEnv('DEEPSLATE_VAD_START_MS', 150, { DEEPSLATE_VAD_START_MS: '200' }), 200);
+    assert.equal(readIntEnv('DEEPSLATE_VAD_START_MS', 150, { DEEPSLATE_VAD_START_MS: 'abc' }), 150);
+    assert.equal(readIntEnv('DEEPSLATE_VAD_START_MS', 150, { DEEPSLATE_VAD_START_MS: '-1' }), 150);
   });
 });
 
 describe('readOptionalIntEnv', () => {
   it('returns a parsed value only when one is configured', () => {
-    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', {}), undefined);
-    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '  ' }), undefined);
-    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '0' }), 0);
-    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '250' }), 250);
+    assert.equal(readOptionalIntEnv('DEEPSLATE_VAD_STOP_MS', {}), undefined);
+    assert.equal(readOptionalIntEnv('DEEPSLATE_VAD_STOP_MS', { DEEPSLATE_VAD_STOP_MS: '  ' }), undefined);
+    assert.equal(readOptionalIntEnv('DEEPSLATE_VAD_STOP_MS', { DEEPSLATE_VAD_STOP_MS: '0' }), 0);
+    assert.equal(readOptionalIntEnv('DEEPSLATE_VAD_STOP_MS', { DEEPSLATE_VAD_STOP_MS: '390' }), 390);
   });
 
   it('treats invalid values as unset so a typo cannot change behaviour', () => {
-    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: 'abc' }), undefined);
-    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '-5' }), undefined);
-    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '1.5' }), 1);
+    assert.equal(readOptionalIntEnv('DEEPSLATE_VAD_STOP_MS', { DEEPSLATE_VAD_STOP_MS: 'abc' }), undefined);
+    assert.equal(readOptionalIntEnv('DEEPSLATE_VAD_STOP_MS', { DEEPSLATE_VAD_STOP_MS: '-5' }), undefined);
+    assert.equal(readOptionalIntEnv('DEEPSLATE_VAD_STOP_MS', { DEEPSLATE_VAD_STOP_MS: '1.5' }), 1);
+  });
+});
+
+describe('readOptionalFloatEnv', () => {
+  it('parses decimal values used by the VAD tuning knobs', () => {
+    assert.equal(readOptionalFloatEnv('DEEPSLATE_VAD_CONFIDENCE', {}), undefined);
+    assert.equal(
+      readOptionalFloatEnv('DEEPSLATE_VAD_CONFIDENCE', { DEEPSLATE_VAD_CONFIDENCE: '0.65' }),
+      0.65,
+    );
+    assert.equal(
+      readOptionalFloatEnv('DEEPSLATE_VAD_MIN_VOLUME', { DEEPSLATE_VAD_MIN_VOLUME: '0' }),
+      0,
+    );
+  });
+
+  it('treats invalid values as unset', () => {
+    assert.equal(
+      readOptionalFloatEnv('DEEPSLATE_VAD_CONFIDENCE', { DEEPSLATE_VAD_CONFIDENCE: 'loud' }),
+      undefined,
+    );
+    assert.equal(
+      readOptionalFloatEnv('DEEPSLATE_VAD_CONFIDENCE', { DEEPSLATE_VAD_CONFIDENCE: '-0.2' }),
+      undefined,
+    );
   });
 });
 

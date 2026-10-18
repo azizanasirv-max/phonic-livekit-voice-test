@@ -2,25 +2,25 @@
  * LiveKit `AgentSession` construction and the turn-handling policy the voice
  * agent runs with.
  *
- * This module is the integration boundary between Phonic and LiveKit: Phonic
- * detects turns and interruptions, and LiveKit decides what happens to audio
- * that has already been queued for playback. The policy below pins the parts of
- * that hand-off the agent depends on, so a future change to session options (or
- * to LiveKit's defaults) cannot silently re-enable client-side interruption
- * behaviour that would let an interrupted response keep playing.
+ * This module is provider-independent: Deepslate Opal (via `src/deepslate.ts`)
+ * detects turns and interruptions server-side, and LiveKit decides what happens
+ * to audio that has already been queued for playback. The policy below pins the
+ * parts of that hand-off the agent depends on, so a future change to session
+ * options (or to LiveKit's defaults) cannot silently re-enable client-side
+ * interruption behaviour that would let an interrupted response keep playing.
  *
- * See README section 5 for the full interruption lifecycle and its limits.
+ * See README "Interruption" for the full lifecycle and its limits.
  */
 import { type llm, voice } from '@livekit/agents';
 
 /** Turn-handling settings this agent always runs with. */
 export type TurnHandlingPolicy = {
   /**
-   * Phonic does its own server-side turn detection. Naming it explicitly keeps
-   * that behaviour (LiveKit resolves `realtime_llm` to "the realtime model
-   * detects turns") and stops a stray VAD / turn-detector from taking over
-   * endpointing, which would make Phonic's interruption events and LiveKit's
-   * turn boundaries disagree.
+   * Opal does its own server-side turn detection and VAD. Naming it explicitly
+   * keeps that behaviour (LiveKit resolves `realtime_llm` to "the realtime
+   * model detects turns") and stops a stray client-side VAD / turn detector
+   * from taking over endpointing, which would make the provider's interruption
+   * events and LiveKit's turn boundaries disagree.
    */
   turnDetection: 'realtime_llm';
   interruption: {
@@ -37,10 +37,10 @@ export type TurnHandlingPolicy = {
      * good, and the next response starts from silence.
      *
      * That pause/resume path is driven by LiveKit's client-side interruption
-     * detection, which is inactive while Phonic owns turn detection — so this is
-     * a guard rather than a fix for an observed fault. It is pinned anyway so the
-     * guarantee cannot be lost by a later change to the VAD or turn-detection
-     * settings.
+     * detection, which is inactive while the realtime model owns turn
+     * detection — so this is a guard rather than a fix for an observed fault.
+     * It is pinned anyway so the guarantee cannot be lost by a later change to
+     * the VAD or turn-detection settings.
      */
     resumeFalseInterruption: false;
     /**
@@ -49,9 +49,9 @@ export type TurnHandlingPolicy = {
      */
     discardAudioIfUninterruptible: true;
     /**
-     * Client-side word/duration thresholds stay at zero: Phonic already gates
-     * interruptions server-side (`minWordsToInterrupt`), and stacking a second
-     * threshold here would delay the stop further.
+     * Client-side word/duration thresholds stay at zero: Opal already gates
+     * interruptions server-side, and stacking a second threshold here would
+     * delay the stop further.
      */
     minWords: 0;
     minDuration: 0;
@@ -86,10 +86,11 @@ export function resolveTurnHandling(): {
 }
 
 /**
- * Create the `AgentSession` for a Phonic realtime model.
+ * Create the `AgentSession` for a realtime speech-to-speech model.
  *
- * Phonic stays the only model in the session — no STT/LLM/TTS pipeline and no
- * extra VAD — so audio-only calling keeps working exactly as before.
+ * The realtime model stays the only model in the session — no STT/LLM/TTS
+ * pipeline and no extra VAD — so Opal handles understanding, generation and
+ * turn taking end to end.
  */
 export function createAgentSession(llm: llm.RealtimeModel): voice.AgentSession {
   return new voice.AgentSession({
