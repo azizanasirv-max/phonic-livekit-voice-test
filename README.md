@@ -4,11 +4,11 @@ A deliberately small prototype for **one** purpose: prove that a real participan
 spoken conversation with **Deepslate Opal** through the **LiveKit Agents (Node.js)** agent that
 already existed in this repository, including interrupting Opal mid-sentence.
 
-> **Status: implementation complete, live conversation not yet verified.**
-> No Deepslate, LiveKit Cloud or TTS credentials were available in the build environment, so the
-> automated checks below all pass but the real microphone/speaker test in section 6 is **manual and
-> still outstanding**. See "Outstanding blockers" at the end. Stage 1 is not complete until that
-> test is performed.
+> **Status: code complete and validated; deployment blocked on a GitHub permission; live microphone
+> test still manual.** The GitHub App available for this change can push code but has no `workflows`
+> permission, so GitHub rejects any change under `.github/workflows`. The repaired workflow is
+> therefore delivered as `deployment/deploy.yml` and has **not** been dispatched. The agent currently
+> deployed on LiveKit Cloud still runs the previous provider. See sections 12 and 13.
 
 ---
 
@@ -24,38 +24,38 @@ the transport; nothing was replaced.
 
 ---
 
-## 2. Audit of the repository before the change
+## 2. Upgrade from the legacy provider
 
-The repository was a Phonic + LiveKit prototype (its own README stated that no live voice conversation had
-yet been verified). The parts that mattered:
+The repository was originally a prototype that wrapped a different realtime speech-to-speech
+provider. The LiveKit-facing parts were reusable; the provider layer was not.
 
-| Area | Original implementation | Reusable? |
+| Area | Before | Decision |
 | --- | --- | --- |
 | Entry point | `src/main.ts` — `defineAgent({ entry })` + `cli.runApp(new ServerOptions(...))`; `npm run dev` / `npm start` | **Reused** |
 | LiveKit SDK | `@livekit/agents@1.9.3`, `@livekit/rtc-node@^1.1.0` | **Reused unchanged** |
-| Provider | `@livekit/agents-plugin-phonic@1.9.3`, wrapped by `src/phonic.ts` | Phonic-specific; isolated |
+| Provider | Legacy vendor plugin, wrapped by a vendor module | **Removed.** Replaced by `@deepslate-labs/livekit@0.1.23` and `src/deepslate.ts` |
 | Session | `src/session.ts` — one `AgentSession` with a single realtime `llm`; no STT/LLM/TTS stack | **Reused**, comments generalised |
 | Room lifecycle | `ctx.connect()` + `session.start({ agent, room })` + `generateReply()` greeting; automatic or explicit dispatch via `LIVEKIT_AGENT_NAME` | **Reused** (connection now happens before session start, matching the official Opal quick start) |
 | Turn handling | `turnDetection: 'realtime_llm'`; interruptions enabled; `resumeFalseInterruption: false`; no client-side word/duration thresholds | **Reused** |
 | Interruption | Provider server-side VAD reports speech onset; LiveKit interrupts the active `SpeechHandle` and flushes queued audio | **Reused**; Opal produces the same LiveKit event |
 | Config | `src/config.ts` — required vars, `ConfigError`, masking, redaction; `npm run check:env` | **Reused**, variables changed |
 | Logging | `src/logging.ts` — redacts secrets from every line | **Reused unchanged** |
-| Tests | 46 tests: config, prompt, Phonic wiring, turn policy, real-`AgentSession` interruption harness | **Reused/extended** (63 tests now) |
-| Deployment | Multi-stage `Dockerfile`, manual-only LiveKit Cloud workflow, `livekit.toml` | **Reused**; Dockerfile comments updated, workflows untouched, nothing deployed |
+| Tests | Config, prompt, legacy vendor wiring, turn policy, real-`AgentSession` interruption harness | **Vendor wiring test removed**; the provider-independent interruption harness is retained and adapted |
+| Deployment | Multi-stage `Dockerfile`, manual LiveKit Cloud workflow with a legacy-secret preflight | **Dockerfile reused**; workflow rewritten for the existing agent and Deepslate secrets |
 
-**Phonic-specific parts:** `src/phonic.ts`, `@livekit/agents-plugin-phonic`, `PHONIC_*` env vars, the
-Phonic fake in `tests/fake-phonic-realtime.ts`, and the old README timings. Phonic is no longer
-imported by `src/main.ts`; its module and tests are retained only as isolated reference/regression
-coverage so existing working code was not deleted.
+**Removed completely:** the legacy adapter module, its vendor plugin dependency, its API-key,
+voice and VAD variables, the vendor-specific test double and wiring test, the legacy instructions
+in the deployment documentation, and the workflow's legacy secret preflight and secret references.
+The shared interruption harness was kept because it tests LiveKit's behaviour, not the vendor's.
 
-**Voice-session lifecycle before:** validate `PHONIC_API_KEY` → build `RealtimeModel` → wrap it in
-`AgentSession` with the fixed turn policy → attach Error/Speech/State listeners → `session.start()` →
-`ctx.connect()` → `generateReply()` for the greeting.
+There is no fallback path: `src/main.ts` constructs only the Deepslate model, and
+`tests/provider-consistency.test.ts` fails if a legacy dependency, source reference, environment
+variable or workflow secret reference is reintroduced.
 
-**Interruption behaviour before:** Phonic's server VAD emitted `user_started_speaking`; the plugin
-forwarded it as LiveKit `input_speech_started` and closed the generation, so LiveKit interrupted the
-active response and cleared its agent-side playback queue. The old README correctly documented that
-audio already sent over RTP or buffered in the client cannot be recalled.
+**Voice-session lifecycle now:** validate Deepslate + LiveKit config → build the Opal
+`RealtimeModel` → wrap it in `AgentSession` with the fixed turn policy → attach
+Error/Speech/State listeners → `ctx.connect()` → `session.start()` → `generateReply()` for the
+greeting.
 
 ---
 
@@ -136,7 +136,7 @@ participant speakers ◄── LiveKit room ◄── AgentSession audio output 
 - `src/config.ts` validates variables, masks/redacts secrets, and checks `LIVEKIT_URL`.
 - `src/check-env.ts` prints a masked summary plus the TTS backend, exiting non-zero on problems.
 
-`src/phonic.ts` and its tests remain in the tree but are not imported by the running agent.
+The running agent imports only `src/deepslate.ts`; a provider-consistency test guards that isolation.
 
 
 ---
@@ -251,8 +251,8 @@ not delay Opal's stop signal.
 - **Already-transmitted audio cannot be recalled.** Frames that left the agent over WebRTC, plus
   whatever the participant's jitter/playback buffer holds, will finish playing. Only the agent-side
   queue can be flushed.
-- **No configurable interruption word count.** Unlike Phonic's `minWordsToInterrupt`, the Opal plugin
-  has no equivalent option; barge-in timing is controlled by server-side VAD.
+- **No configurable interruption word count.** The Opal plugin exposes no word-count gate; barge-in
+  timing is controlled by server-side VAD.
 - **`clearAudio()` is not supported by the backend.** The plugin logs
   `clearAudio not yet supported by the Deepslate backend`; it does not cancel server generation
   beyond closing the local generation.
@@ -280,15 +280,16 @@ Environment: Node `v24.15.0`, npm `11.12.1`, Linux. Commands run from the reposi
 | Check | Command | Result |
 | --- | --- | --- |
 | Type check | `npm run typecheck` | **PASS** — 0 errors |
-| Unit/integration tests | `npm test` | **PASS** — 63 tests, 63 passed, 0 failed |
-| Production install | `npm ci --omit=dev` | **PASS** — 176 packages, single `@livekit/rtc-node@1.1.0` |
+| Unit/integration tests | `npm test` | **PASS** — 60 tests, 60 passed, 0 failed |
+| Production install | `npm ci --omit=dev` | **PASS** — 174 packages, single `@livekit/rtc-node@1.1.0` |
 | Missing config | `npm run check:env` with no `.env` | **PASS (expected failure)** — exits 1, lists the six missing variables |
 | Agent startup | `node src/main.ts dev` with placeholder creds and an unreachable `ws://127.0.0.1:7880` | **PASS** — worker starts, binds a port, retries with clear `ECONNREFUSED` messages |
 | Secret redaction | grep startup output for the placeholder key/secret | **PASS** — 0 raw matches; values shown as `****` |
 | Opal model init | construct `createRealtimeModel()` with fake env | **PASS** — `model=deepslate-realtime audio=true`, hosted TTS resolved |
-| **Live Opal conversation** | sections 6.1–6.3 | **NOT RUN — requires real credentials and a microphone** |
+| **Live Opal conversation** | sections 6.1–6.3 | **NOT RUN — requires a microphone and an operator** |
+| **Deployed agent + room smoke test** | `deployment/deploy.yml` | **NOT RUN — workflow cannot be activated without GitHub `workflows` permission (section 13)** |
 
-The 63 tests include:
+The 60 tests include:
 
 - `tests/deepslate.test.ts` (new): provider construction, explicit credential passing, model
   selection, VAD overrides (including out-of-range rejection), hosted-vs-ElevenLabs resolution,
@@ -301,8 +302,8 @@ The 63 tests include:
   interruption contract: one-word barge-in stops the response, in-flight generation is cancelled,
   cancelled audio is never scheduled, a new response starts afterwards, repeated interruptions do not
   duplicate audio, and the session recovers after a provider drop.
-- `tests/phonic.test.ts` (unchanged, still passing): isolated Phonic wiring retained as regression
-  coverage; it is not used by the agent.
+- `tests/provider-consistency.test.ts` (new): fails if a legacy provider dependency, adapter, env
+  variable or workflow secret reference returns, so the agent cannot silently switch providers.
 
 **Honesty note:** the interruption suite exercises LiveKit's real code with a provider double; it does
 not prove Opal's live server VAD. Opal's own `playbackBufferClear → input_speech_started` wiring is
@@ -340,46 +341,90 @@ verified from the pinned plugin source and must be confirmed with the manual int
 
 | File | Change |
 | --- | --- |
-| `src/deepslate.ts` | **New.** Opal model construction, model/VAD/TTS resolution, audio requirement, `ConfigError`s |
+| `src/deepslate.ts` | Opal model construction, model/VAD/TTS resolution, audio requirement, `ConfigError`s |
 | `src/main.ts` | Uses Opal; validates all config; connects before session start; structured error handling |
 | `src/config.ts` | Deepslate required/secret vars, masked summary, float env parsing |
 | `src/check-env.ts` | Validates and reports the TTS backend |
-| `src/session.ts` | Comments generalised; policy unchanged (provider-independent) |
-| `src/agent.ts` | Comment updated; prompt unchanged |
-| `.env.example` | Deepslate + TTS + VAD placeholders |
-| `package.json` | Adds `@deepslate-labs/livekit@0.1.23`; rtc-node override; description |
-| `package-lock.json` | Regenerated for the new dependency and override |
-| `tests/deepslate.test.ts` | **New.** Opal provider/configuration/capability tests |
-| `tests/config.test.ts` | Updated for the new variables + float parsing |
-| `tests/session.test.ts` | Comment updates only; assertions unchanged |
-| `Dockerfile` | Provider comments updated; install unchanged (override lives in `package.json`) |
-| `.github/workflows/phonic-deploy.yml`, `.github/workflows/deploy.yml.` | **Unchanged.** The available GitHub App token lacks `workflows` permission; the manual deploy preflight still references Phonic and must be updated before any deployment |
-| `README.md` | Replaced with this audit/integration/test report |
-
-`src/phonic.ts`, `tests/phonic.test.ts` and `tests/fake-phonic-realtime.ts` are intentionally
-untouched and unused by the running agent.
+| `src/session.ts` | Provider-independent turn/interruption policy |
+| `src/agent.ts` | Provider-independent prompt |
+| `src/logging.ts` | Redacts credentials from every log line |
+| `src/phonic.ts` | **Deleted.** Legacy vendor adapter; nothing imports it any more |
+| `.env.example` | Deepslate + TTS + VAD placeholders; no legacy variables |
+| `package.json`, `package-lock.json` | Deepslate plugin added, legacy plugin removed, `@livekit/rtc-node` override, renamed package |
+| `tests/deepslate.test.ts` | Opal provider/configuration/capability tests |
+| `tests/config.test.ts` | Required-variable, masking/redaction and `LIVEKIT_URL` tests |
+| `tests/session.test.ts` | Turn/interruption policy tests |
+| `tests/interruption.test.ts` | Provider-independent interruption lifecycle against the real LiveKit session |
+| `tests/fake-realtime-model.ts` | Provider-neutral realtime-model test double (renamed and adapted from the legacy fake) |
+| `tests/phonic.test.ts` | **Deleted.** Legacy vendor wiring test |
+| `tests/provider-consistency.test.ts` | **New.** Guards against reintroducing a second provider |
+| `scripts/room-smoke.ts` | **New.** Joins a real LiveKit room and waits for the deployed agent (no microphone) |
+| `Dockerfile` | Provider comments updated; reproducible `npm ci --omit=dev` install |
+| `deployment/deploy.yml` | **New.** Repaired workflow: verify -> deploy the existing agent -> status -> room smoke test -> logs. Pending activation under `.github/workflows/` (permission blocker) |
+| `deployment/README.md` | **New.** Exact activation steps and required secret names |
+| `.github/workflows/*` | **Unchanged on the remote.** GitHub rejects workflow changes from this App (no `workflows` permission); see section 12 |
+| `README.md` | This report |
 
 ---
 
-## 12. Git workflow
+## 12. Deployment workflow
 
-- Branch: `cline/5myazpr0` (created from the current checkout; default branch untouched).
-- No merge or deployment was performed.
-- Pull request: opened or reported separately after the final push; see the branch/commit details in
-  the hand-off message.
+`deployment/deploy.yml` is the repaired workflow. It is manual-only (`workflow_dispatch`) and preserves
+the existing agent identity from the committed `livekit.toml` (`project subdomain =
+shopify-execution-fwmg7op6`, `agent id = CA_y4mXvu49sfag`). It never runs the LiveKit `create`
+operation, never regenerates `livekit.toml`, and refuses to continue if that identity is missing.
+
+**It is not active yet.** The App used for this task (`cline-cloud[bot]`) has `contents: write` but no
+`workflows` permission, so this push was rejected:
+
+```
+! [remote rejected] ... (refusing to allow a GitHub App to create or update workflow
+`.github/workflows/deploy.yml` without `workflows` permission)
+```
+
+That control was not bypassed. A repository administrator must copy `deployment/deploy.yml` to
+`.github/workflows/deploy.yml`, delete the two old workflow files, and push with a token that has the
+`workflows` permission. Exact commands are in `deployment/README.md`. Until that happens the old
+manual workflow remains active and must not be dispatched: it requires the removed provider's secret
+and would ship this code without Deepslate configuration.
+
+Order of operations:
+
+1. `npm ci`, `npm run typecheck`, `npm test`.
+2. Parse and validate `livekit.toml`; refuse to continue if the project or agent id is missing.
+3. Build the deploy-action `SECRET_LIST` from the individual Deepslate/ElevenLabs repository secrets,
+   migrating any legacy `SECRET_LIST` and dropping obsolete vendor entries. Every value is masked
+   with `::add-mask::`; only variable names are printed.
+4. `npm run check:env` with the resolved configuration (masked output).
+5. `livekit/deploy-action@v2.12.2` with `OPERATION: deploy` (never `create`).
+6. `OPERATION: status-retry` (10 minute timeout) to wait for a healthy version.
+7. `lk agent status --id <existing id>` to record the deployed version.
+8. Optional room smoke test: a subscribe-only participant joins a temporary room and waits for the
+   deployed agent (up to 120 s). This proves job dispatch and room connection only.
+9. `lk agent logs` (bounded by `timeout`) captured to the run artifact; deterministic configuration
+   errors fail the run.
+10. A run summary records the project, agent id, commit and each outcome.
+
+Repository secret names (values are never printed or committed): `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+`LIVEKIT_API_SECRET`, `DEEPSLATE_VENDOR_ID`, `DEEPSLATE_ORGANIZATION_ID`, `DEEPSLATE_API_KEY`, and
+`DEEPSLATE_HOSTED_VOICE_ID` (or `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`). The workflow also
+honours `DEEPSLATE_MODEL`, the optional `DEEPSLATE_VAD_*` tuning variables, `ELEVENLABS_MODEL_ID`,
+and `LIVEKIT_AGENT_NAME`.
 
 ---
 
 ## 13. Outstanding blockers / manual steps
 
-1. **Live credentials are required for acceptance.** The build environment had no Deepslate, LiveKit
-   Cloud or ElevenLabs credentials, so the real conversation and interruption test in section 6 has
-   **not been executed**. Together with item 2, this is the remaining Stage 1 completion criterion.
-2. **A TTS backend must be provisioned.** Either create/clone a voice in the Deepslate platform and
+1. **GitHub workflow permission blocks activation and deployment.** The App token cannot create,
+   update or delete `.github/workflows/**` (`refusing to allow a GitHub App to create or update
+   workflow ... without 'workflows' permission`). The code is pushed; the workflow is in
+   `deployment/deploy.yml`. An administrator must activate it as described in `deployment/README.md`
+   and run it. **No deployment was performed**, so the existing agent was not modified.
+2. **Real microphone acceptance is manual.** The automated room smoke test cannot prove speech
+   recognition, spoken output, barge-in or recovery. Run section 6 with a real microphone.
+3. **A TTS backend must be provisioned.** Either create/clone a voice in the Deepslate platform and
    use its `DEEPSLATE_HOSTED_VOICE_ID`, or supply an ElevenLabs key + voice ID. Opal will not emit
    audio without one.
-3. **Manual console step.** Joining a room through the LiveKit Agents dashboard (or `lk agent
-   console`) is manual; there is no automated end-to-end voice test.
 4. **Known SDK peer-range mismatch.** The plugin advertises `@livekit/rtc-node ^0.13.34` while
    `@livekit/agents@1.9.3` requires `^1.1.0`. The npm override was verified with a clean install and
    model construction; if Deepslate publishes a plugin version with an updated peer range, remove the
@@ -387,7 +432,6 @@ untouched and unused by the running agent.
 5. **Residual audio tail.** Audio already sent over RTP or buffered by the participant cannot be
    cancelled by the agent (section 7.3). Expect a short tail after a barge-in; this is a transport
    limit, not a missing cancellation call.
-6. **No deployment performed.** The LiveKit Cloud workflow was not modified (the GitHub App token
-   used here lacks `workflows` permission) and was not triggered. Its `SECRET_LIST` preflight still
-   checks `PHONIC_API_KEY`; update it to the Deepslate variables before deploying. `livekit.toml` was
-   not modified.
+6. **Packet-loss/jitter/RTT metrics** require a publisher with a media track. The smoke client is
+   subscribe-only, so it records connection state and quality events only; the manual console test
+   covers the real audio path.

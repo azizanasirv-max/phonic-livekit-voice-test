@@ -1,0 +1,447 @@
+# =============================================================================
+# PENDING ACTIVATION - this file is intentionally NOT under .github/workflows.
+#
+# The GitHub App used for this change (cline-cloud[bot]) has `contents: write`
+# but not the `workflows` permission, so GitHub rejects any push that creates,
+# updates or deletes a file under .github/workflows:
+#
+#   remote rejected ... (refusing to allow a GitHub App to create or update
+#   workflow `.github/workflows/deploy.yml` without `workflows` permission)
+#
+# A repository administrator must activate this workflow:
+#   1. copy this file to .github/workflows/deploy.yml
+#   2. delete .github/workflows/phonic-deploy.yml and .github/workflows/deploy.yml.
+#   3. commit and push with a token that has the `workflows` permission
+#   4. run "Deploy LiveKit Cloud Agent" from the Actions tab
+#
+# See deployment/README.md. Until then the previous workflow remains active and
+# must not be dispatched: it supplies the removed provider's secret and would
+# deploy this code without the required Deepslate configuration.
+# =============================================================================
+
+# Deploy a new version of the EXISTING Deepslate Opal LiveKit Cloud agent.
+#
+# Identity comes from the committed livekit.toml:
+#   [project] subdomain = "<existing project>"
+#   [agent]   id        = "CA_<existing agent>"
+#
+# This workflow never runs the LiveKit "create" operation. It only ships a new
+# version of that agent and then checks its status, so it cannot register a
+# second production agent by accident.
+#
+# MANUAL ONLY: there is no push/pull_request trigger. Nothing reaches LiveKit
+# Cloud unless a human starts a run from the Actions tab.
+#
+# Repository secrets (Settings -> Secrets and variables -> Actions):
+#   LIVEKIT_URL                existing LiveKit deployment credential
+#   LIVEKIT_API_KEY            existing LiveKit deployment credential
+#   LIVEKIT_API_SECRET         existing LiveKit deployment credential
+#   DEEPSLATE_VENDOR_ID        Deepslate vendor id
+#   DEEPSLATE_ORGANIZATION_ID  Deepslate organization id
+#   DEEPSLATE_API_KEY          Deepslate API key (secret)
+#   DEEPSLATE_HOSTED_VOICE_ID  OR ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID
+#
+# Optional secrets: DEEPSLATE_MODEL, DEEPSLATE_VAD_START_MS,
+# DEEPSLATE_VAD_STOP_MS, DEEPSLATE_VAD_CONFIDENCE, DEEPSLATE_VAD_MIN_VOLUME,
+# DEEPSLATE_VAD_BACKBUFFER_MS, ELEVENLABS_MODEL_ID, LIVEKIT_AGENT_NAME.
+#
+# Backwards compatibility: if the legacy `SECRET_LIST` repository secret still
+# exists, its KEY=VALUE pairs are migrated into the new list and obsolete
+# provider entries are dropped. Individual repository secrets take precedence.
+#
+# No value is ever printed. Each value placed in the deploy-action SECRET_LIST
+# input is registered with ::add-mask:: first.
+name: Deploy LiveKit Cloud Agent
+
+on:
+  workflow_dispatch:
+    inputs:
+      region:
+        description: >-
+          Optional LiveKit Cloud region (for example "us-east"). Leave empty to
+          deploy to the region the agent already uses / the nearest region.
+        required: false
+        type: string
+        default: ""
+      room_smoke_test:
+        description: >-
+          After deployment, join a temporary LiveKit room with a subscribe-only
+          participant and verify that the deployed agent joins it.
+        required: false
+        type: boolean
+        default: true
+
+# One fixed group, so two deployments to the same LiveKit Cloud agent can never
+# race. cancel-in-progress is deliberately false: cancelling halfway through a
+# container build or deploy could leave the agent partially updated.
+concurrency:
+  group: livekit-cloud-agent-deploy
+  cancel-in-progress: false
+
+# The workflow only reads the repository. It does not commit or push anything.
+permissions:
+  contents: read
+
+jobs:
+  deploy:
+    name: Verify and deploy existing agent
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "24"
+          cache: npm
+
+      - name: Install dependencies from the lockfile
+        run: npm ci
+
+      - name: Type check
+        run: npm run typecheck
+
+      - name: Run tests
+        run: npm test
+
+      # livekit.toml is the deployment identity. It is read, never rewritten.
+      # Refusing to continue here is what keeps this an upgrade of the existing
+      # agent rather than the creation of a new one.
+      - name: Preflight livekit.toml (existing agent identity)
+        run: |
+          set -euo pipefail
+          if [ ! -f livekit.toml ]; then
+            echo "::error::livekit.toml is missing. Refusing to deploy: this workflow upgrades the existing agent and never creates one."
+            exit 1
+          fi
+
+          subdomain="$(sed -n 's/^[[:space:]]*subdomain[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
+          agent_id="$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
+
+          if [ -z "$subdomain" ]; then
+            echo "::error::livekit.toml has no [project] subdomain. Refusing to deploy."
+            exit 1
+          fi
+          if [ -z "$agent_id" ]; then
+            echo "::error::livekit.toml has no [agent] id. Refusing to deploy because a missing id could register a new agent."
+            exit 1
+          fi
+          case "$agent_id" in
+            CA_*) : ;;
+            *)
+              echo "::error::livekit.toml agent id does not look like a LiveKit Cloud agent id (expected CA_...). Refusing to deploy."
+              exit 1
+              ;;
+          esac
+          if grep -qiE 'api[_-]?key|api[_-]?secret|token' livekit.toml; then
+            echo "::error::livekit.toml appears to contain credential material. Refusing to deploy."
+            exit 1
+          fi
+
+          echo "Target project subdomain: $subdomain"
+          echo "Target agent id: $agent_id"
+          echo "PROJECT_SUBDOMAIN=$subdomain" >> "$GITHUB_ENV"
+          echo "AGENT_ID=$agent_id" >> "$GITHUB_ENV"
+
+      # Builds the deploy-action SECRET_LIST from individual repository secrets,
+      # migrating (and filtering) any legacy SECRET_LIST value. Only secret
+      # NAMES are printed; every value is masked before it is used.
+      - name: Resolve agent configuration
+        id: secrets
+        env:
+          LEGACY_SECRET_LIST: ${{ secrets.SECRET_LIST }}
+          DEEPSLATE_VENDOR_ID: ${{ secrets.DEEPSLATE_VENDOR_ID }}
+          DEEPSLATE_ORGANIZATION_ID: ${{ secrets.DEEPSLATE_ORGANIZATION_ID }}
+          DEEPSLATE_API_KEY: ${{ secrets.DEEPSLATE_API_KEY }}
+          DEEPSLATE_MODEL: ${{ secrets.DEEPSLATE_MODEL }}
+          DEEPSLATE_HOSTED_VOICE_ID: ${{ secrets.DEEPSLATE_HOSTED_VOICE_ID }}
+          DEEPSLATE_VAD_START_MS: ${{ secrets.DEEPSLATE_VAD_START_MS }}
+          DEEPSLATE_VAD_STOP_MS: ${{ secrets.DEEPSLATE_VAD_STOP_MS }}
+          DEEPSLATE_VAD_CONFIDENCE: ${{ secrets.DEEPSLATE_VAD_CONFIDENCE }}
+          DEEPSLATE_VAD_MIN_VOLUME: ${{ secrets.DEEPSLATE_VAD_MIN_VOLUME }}
+          DEEPSLATE_VAD_BACKBUFFER_MS: ${{ secrets.DEEPSLATE_VAD_BACKBUFFER_MS }}
+          ELEVENLABS_API_KEY: ${{ secrets.ELEVENLABS_API_KEY }}
+          ELEVENLABS_VOICE_ID: ${{ secrets.ELEVENLABS_VOICE_ID }}
+          ELEVENLABS_MODEL_ID: ${{ secrets.ELEVENLABS_MODEL_ID }}
+          LIVEKIT_AGENT_NAME: ${{ secrets.LIVEKIT_AGENT_NAME }}
+        run: |
+          set -euo pipefail
+
+          declare -A values=()
+          declare -a order=()
+
+          trim() {
+            local value="$1"
+            value="${value#"${value%%[![:space:]]*}"}"
+            value="${value%"${value##*[![:space:]]}"}"
+            printf '%s' "$value"
+          }
+
+          add_pair() {
+            local key value
+            key="$(trim "$1")"
+            value="$(trim "$2")"
+            [ -n "$key" ] || return 0
+            [ -n "$value" ] || return 0
+            case "$key" in
+              PHONIC_*)
+                echo "::notice::Dropping obsolete $key from the legacy SECRET_LIST."
+                return 0
+                ;;
+            esac
+            if [ -z "${values[$key]+set}" ]; then
+              order+=("$key")
+            fi
+            values["$key"]="$value"
+            echo "::add-mask::$value"
+          }
+
+          # 1. Migrate the legacy KEY=VALUE list, if the repository still has it.
+          IFS=',' read -r -a pairs <<< "${LEGACY_SECRET_LIST:-}"
+          for pair in "${pairs[@]}"; do
+            [ -n "$pair" ] || continue
+            add_pair "${pair%%=*}" "${pair#*=}"
+          done
+
+          # 2. Individual repository secrets override migrated entries.
+          add_pair DEEPSLATE_VENDOR_ID "${DEEPSLATE_VENDOR_ID:-}"
+          add_pair DEEPSLATE_ORGANIZATION_ID "${DEEPSLATE_ORGANIZATION_ID:-}"
+          add_pair DEEPSLATE_API_KEY "${DEEPSLATE_API_KEY:-}"
+          add_pair DEEPSLATE_MODEL "${DEEPSLATE_MODEL:-}"
+          add_pair DEEPSLATE_HOSTED_VOICE_ID "${DEEPSLATE_HOSTED_VOICE_ID:-}"
+          add_pair DEEPSLATE_VAD_START_MS "${DEEPSLATE_VAD_START_MS:-}"
+          add_pair DEEPSLATE_VAD_STOP_MS "${DEEPSLATE_VAD_STOP_MS:-}"
+          add_pair DEEPSLATE_VAD_CONFIDENCE "${DEEPSLATE_VAD_CONFIDENCE:-}"
+          add_pair DEEPSLATE_VAD_MIN_VOLUME "${DEEPSLATE_VAD_MIN_VOLUME:-}"
+          add_pair DEEPSLATE_VAD_BACKBUFFER_MS "${DEEPSLATE_VAD_BACKBUFFER_MS:-}"
+          add_pair ELEVENLABS_API_KEY "${ELEVENLABS_API_KEY:-}"
+          add_pair ELEVENLABS_VOICE_ID "${ELEVENLABS_VOICE_ID:-}"
+          add_pair ELEVENLABS_MODEL_ID "${ELEVENLABS_MODEL_ID:-}"
+          add_pair LIVEKIT_AGENT_NAME "${LIVEKIT_AGENT_NAME:-}"
+
+          # 3. Fail clearly, by name only, when configuration is incomplete.
+          missing=()
+          for key in DEEPSLATE_VENDOR_ID DEEPSLATE_ORGANIZATION_ID DEEPSLATE_API_KEY; do
+            if [ -z "${values[$key]:-}" ]; then
+              missing+=("$key")
+            fi
+          done
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required Deepslate configuration: ${missing[*]}. Add each as a repository secret under Settings -> Secrets and variables -> Actions."
+            exit 1
+          fi
+
+          hosted="${values[DEEPSLATE_HOSTED_VOICE_ID]:-}"
+          eleven_key="${values[ELEVENLABS_API_KEY]:-}"
+          eleven_voice="${values[ELEVENLABS_VOICE_ID]:-}"
+          if [ -z "$hosted" ] && { [ -z "$eleven_key" ] || [ -z "$eleven_voice" ]; }; then
+            echo "::error::No audio output configured. Set DEEPSLATE_HOSTED_VOICE_ID, or set both ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID."
+            exit 1
+          fi
+
+          echo "Agent secret names supplied: ${order[*]}"
+
+          secret_list=""
+          for key in "${order[@]}"; do
+            if [ -z "$secret_list" ]; then
+              secret_list="$key=${values[$key]}"
+            else
+              secret_list="$secret_list,$key=${values[$key]}"
+            fi
+          done
+
+          {
+            echo "SECRET_LIST=$secret_list"
+            echo "AGENT_NAME=${values[LIVEKIT_AGENT_NAME]:-}"
+          } >> "$GITHUB_OUTPUT"
+
+          # Expose the resolved provider configuration to the next step only so
+          # `npm run check:env` can validate it without a populated .env file.
+          for key in "${!values[@]}"; do
+            case "$key" in
+              DEEPSLATE_*|ELEVENLABS_*)
+                echo "$key=${values[$key]}" >> "$GITHUB_ENV"
+                ;;
+            esac
+          done
+
+      - name: Validate runtime configuration
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+        run: |
+          set -euo pipefail
+          missing=()
+          [ -n "${LIVEKIT_URL:-}" ] || missing+=("LIVEKIT_URL")
+          [ -n "${LIVEKIT_API_KEY:-}" ] || missing+=("LIVEKIT_API_KEY")
+          [ -n "${LIVEKIT_API_SECRET:-}" ] || missing+=("LIVEKIT_API_SECRET")
+          if [ "${#missing[@]}" -gt 0 ]; then
+            echo "::error::Missing required LiveKit deployment credential(s): ${missing[*]}."
+            exit 1
+          fi
+          npm run check:env
+
+      # OPERATION "deploy" ships a new version of the agent named in
+      # livekit.toml. OPERATION "create" is deliberately never used.
+      - name: Deploy new version of the existing agent
+        id: deploy
+        uses: livekit/deploy-action@v2.12.2
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          SECRET_LIST: ${{ steps.secrets.outputs.SECRET_LIST }}
+        with:
+          OPERATION: deploy
+          WORKING_DIRECTORY: "."
+          REGION: ${{ inputs.region }}
+
+      - name: Wait for the new version to become healthy
+        id: status
+        uses: livekit/deploy-action@v2.12.2
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+        with:
+          OPERATION: status-retry
+          WORKING_DIRECTORY: "."
+          TIMEOUT: 10m
+
+      - name: Install LiveKit CLI
+        id: cli
+        run: |
+          set -euo pipefail
+          curl -sSL https://get.livekit.io/cli | bash
+          export PATH="$HOME/.local/bin:$PATH"
+          lk version
+          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+
+      - name: Show deployed agent status and version
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          AGENT_ID: ${{ env.AGENT_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          lk agent status --id "$AGENT_ID" | tee diagnostics/agent-status.txt
+
+      # Proves the deployed worker accepts a job and joins a real LiveKit room.
+      # It does not publish microphone audio; the manual console test in
+      # README section 6 covers speech, barge-in and recovery.
+      - name: Room connection smoke test
+        id: smoke
+        if: ${{ inputs.room_smoke_test }}
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          LIVEKIT_AGENT_NAME: ${{ steps.secrets.outputs.AGENT_NAME }}
+        run: |
+          set -euo pipefail
+          room="stage1-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          args=(
+            --join
+            --room "$room"
+            --identity stage1-smoke
+            --valid-for 10m
+            --grant '{"canPublish":false,"canSubscribe":false}'
+            --token-only
+          )
+          if [ -n "${LIVEKIT_AGENT_NAME:-}" ]; then
+            args+=(--agent "$LIVEKIT_AGENT_NAME")
+            echo "Dispatching the configured agent explicitly."
+          else
+            echo "Using automatic dispatch (no LIVEKIT_AGENT_NAME configured)."
+          fi
+          token="$(lk token create "${args[@]}")"
+          echo "::add-mask::$token"
+          LIVEKIT_TOKEN="$token" LIVEKIT_ROOM="$room" node scripts/room-smoke.ts
+
+      # `lk agent logs` streams, so each call is bounded by `timeout`. Logs are
+      # collected on success too: startup and session messages are the evidence
+      # that the deployed provider configuration was actually loaded.
+      - name: Collect deployment logs
+        id: logs
+        if: ${{ always() && steps.cli.outcome == 'success' }}
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          AGENT_ID: ${{ env.AGENT_ID }}
+        run: |
+          set -euo pipefail
+          mkdir -p diagnostics
+          timeout 30s lk agent logs --id "$AGENT_ID" --log-type deploy 2>&1 | tee diagnostics/agent-deploy.log || true
+          timeout 30s lk agent logs --id "$AGENT_ID" --log-type build 2>&1 | tee diagnostics/agent-build.log || true
+
+          # A clear, deterministic configuration failure must fail the run even
+          # if the agent container stayed up. Only names appear in these errors.
+          if grep -aqE 'Missing required environment variable|No audio output configured for Opal' diagnostics/agent-deploy.log; then
+            echo "::error::Agent logs report a configuration failure. See the deployment diagnostics artifact."
+            exit 1
+          fi
+          if grep -aqE 'session error|job failed' diagnostics/agent-deploy.log; then
+            echo "::warning::Agent logs contain session errors or failed jobs. Review the diagnostics artifact."
+          fi
+
+      - name: Upload deployment diagnostics
+        if: ${{ always() }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: livekit-deployment-diagnostics
+          path: diagnostics/
+          if-no-files-found: ignore
+
+      - name: Report result
+        if: ${{ always() }}
+        env:
+          DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
+          STATUS_OUTCOME: ${{ steps.status.outcome }}
+          SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
+          LOGS_OUTCOME: ${{ steps.logs.outcome }}
+          AGENT_ID: ${{ env.AGENT_ID }}
+          PROJECT_SUBDOMAIN: ${{ env.PROJECT_SUBDOMAIN }}
+          COMMIT: ${{ github.sha }}
+          BRANCH: ${{ github.ref_name }}
+          REGION: ${{ inputs.region }}
+        run: |
+          set -euo pipefail
+          report="## LiveKit Cloud agent deployment (existing agent)
+
+          | Item | Result |
+          | --- | --- |
+          | Project subdomain | \`$PROJECT_SUBDOMAIN\` |
+          | Agent id | \`$AGENT_ID\` |
+          | LiveKit deploy outcome | \`$DEPLOY_OUTCOME\` |
+          | Health/status outcome | \`$STATUS_OUTCOME\` |
+          | Room connection smoke test | \`$SMOKE_OUTCOME\` |
+          | Log collection | \`$LOGS_OUTCOME\` |
+          | Branch | \`$BRANCH\` |
+          | Commit | \`$COMMIT\` |
+          | Region | \`$REGION\` |
+          "
+          if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
+            printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
+          else
+            printf '%s\n' "$report"
+          fi
+          if [ "$DEPLOY_OUTCOME" != "success" ]; then
+            echo "::error::The LiveKit deploy operation did not succeed. See the deploy step and diagnostics artifact."
+            exit 1
+          fi
+          if [ "$STATUS_OUTCOME" != "success" ]; then
+            echo "::error::The deployed agent did not become healthy before the timeout."
+            exit 1
+          fi
+          if [ "$SMOKE_OUTCOME" = "failure" ]; then
+            echo "::error::The deployed agent did not join a real LiveKit room in the smoke test."
+            exit 1
+          fi
+          echo "Deployment succeeded and the agent reported healthy."
