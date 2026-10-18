@@ -16,6 +16,7 @@ import { assertRequiredEnv, readEnv, safeEnvSummary } from './config.ts';
 import { GREETING_INSTRUCTIONS } from './instructions.ts';
 import { describeError, logError, logInfo, logWarn } from './logging.ts';
 import { createRealtimeModel, resolvePhonicOptions } from './phonic.ts';
+import { createAgentSession, describeTurnHandling } from './session.ts';
 
 // Load .env before anything reads process.env (ServerOptions resolves
 // LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET when it is constructed).
@@ -31,23 +32,57 @@ export default defineAgent({
     // validated by the agent server with clear errors when it starts.
     assertRequiredEnv(process.env, ['PHONIC_API_KEY']);
 
+    const phonicOptions = resolvePhonicOptions();
+
     logInfo('job accepted', {
       room: ctx.room.name,
-      voice: resolvePhonicOptions().voice,
+      voice: phonicOptions.voice,
     });
 
-    const session = new voice.AgentSession({
+    // The turn-handling policy is fixed (see src/session.ts). Log it once per
+    // job so a run can be matched against the settings it was recorded with.
+    logInfo('turn handling policy', { policy: describeTurnHandling() });
+
+    if (phonicOptions.minWordsToInterrupt > 1) {
+      logWarn('Phonic will not stop the assistant until the user has spoken this many words', {
+        minWordsToInterrupt: phonicOptions.minWordsToInterrupt,
+        effect: "the assistant keeps speaking over the start of the user's interruption",
+      });
+    }
+
+    const session = createAgentSession(
       // Phonic replaces the STT/LLM/TTS pipeline with a single
       // speech-to-speech model. It reads PHONIC_API_KEY from the environment.
-      llm: createRealtimeModel(process.env, (conversationId) => {
+      createRealtimeModel(process.env, (conversationId) => {
         logInfo('phonic conversation created', { conversationId });
       }),
-    });
+    );
 
     // Surface session-level problems (connection drops, provider errors) with
     // redacted messages instead of letting them fail silently.
     session.on(voice.AgentSessionEventTypes.Error, (event) => {
       logError('session error', event.error);
+    });
+
+    // Interruption lifecycle, observed through public session events only. These
+    // lines are what you correlate against a recording to measure how long the
+    // assistant kept talking after the user started: `user_state listening`
+    // (Phonic heard speech) should be immediately followed by `agent_state`
+    // leaving `speaking`, and by `speech created` for the next turn.
+    session.on(voice.AgentSessionEventTypes.SpeechCreated, (event) => {
+      logInfo('speech created', {
+        speechId: event.speechHandle.id,
+        source: event.source,
+        userInitiated: event.userInitiated,
+      });
+    });
+
+    session.on(voice.AgentSessionEventTypes.AgentStateChanged, (event) => {
+      logInfo('agent state', { oldState: event.oldState, newState: event.newState });
+    });
+
+    session.on(voice.AgentSessionEventTypes.UserStateChanged, (event) => {
+      logInfo('user state', { oldState: event.oldState, newState: event.newState });
     });
 
     await session.start({
