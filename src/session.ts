@@ -29,13 +29,18 @@ export type TurnHandlingPolicy = {
     /**
      * Never pause and later resume the agent's audio around user speech.
      *
-     * With this left at LiveKit's default (`true`, with a 2 s
-     * `falseInterruptionTimeout`), a user utterance that LiveKit treats as a
-     * false interruption pauses the audio output and then resumes it, replaying
-     * the buffered remainder of the old response after the user has spoken.
-     * That is exactly the stale-audio overlap this agent must not have, so it is
-     * turned off: an interruption ends the response for good, and the next
-     * response starts from silence.
+     * LiveKit's default (`true`, with a 2 s `falseInterruptionTimeout`) lets a
+     * user utterance it treats as a false interruption pause the audio output and
+     * then resume it, replaying the buffered remainder of the old response after
+     * the user has spoken. That is exactly the stale-audio overlap this agent
+     * must not have, so it is turned off: an interruption ends the response for
+     * good, and the next response starts from silence.
+     *
+     * That pause/resume path is driven by LiveKit's client-side interruption
+     * detection, which is inactive while Phonic owns turn detection — so this is
+     * a guard rather than a fix for an observed fault. It is pinned anyway so the
+     * guarantee cannot be lost by a later change to the VAD or turn-detection
+     * settings.
      */
     resumeFalseInterruption: false;
     /**
