@@ -182,7 +182,7 @@ Manual only (needs live services): steps 1–7 in section 5 — an actual Opal c
 | `src/agent.ts`, `src/instructions.ts` | Prompt-only agent definition |
 | `src/config.ts`, `src/check-env.ts`, `src/logging.ts` | Env handling, preflight, redacted logging |
 | `tests/*.test.ts` | Unit + interruption-lifecycle tests |
-| `Dockerfile`, `livekit.toml`, `.github/workflows/deploy-livekit.yml` | Existing LiveKit Cloud build/deploy path (manual workflow) |
+| `Dockerfile`, `livekit.toml`, `.github/workflows/phonic-deploy.yml` | Existing LiveKit Cloud build/deploy path (manual workflow) |
 
 ---
 
@@ -197,3 +197,5 @@ Established in code and offline tests:
 - interruption behaviour is tested against the real LiveKit session machinery and the plugin's actual semantics.
 
 Not yet established here: a **live** Opal conversation. That requires Deepslate credentials plus a hosted voice id (or ElevenLabs credentials) and a LiveKit project, none of which are present in this environment. Section 5 is the manual acceptance procedure.
+
+> **Deploy workflow follow-up:** `.github/workflows/phonic-deploy.yml` still checks for `PHONIC_API_KEY` in `SECRET_LIST` and its header still says Phonic. It was intentionally left unchanged in this branch because the GitHub App used here lacks `workflows` permission. Before any manual LiveKit Cloud deployment, update it to require `DEEPSLATE_VENDOR_ID`, `DEEPSLATE_ORGANIZATION_ID`, `DEEPSLATE_API_KEY`, and one voice option. Stage 1 does not deploy.
