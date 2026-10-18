@@ -1,17 +1,24 @@
-# Deploy the existing Phonic + LiveKit TypeScript agent to LiveKit Cloud.
+# Deploy the Deepslate Opal + LiveKit TypeScript agent to LiveKit Cloud.
 #
 # Uses the official LiveKit action:
 #   https://github.com/livekit/deploy-action
 #
 # This workflow is MANUAL ONLY. It has no `push` and no `pull_request`
 # trigger, so nothing is ever deployed to LiveKit Cloud unless a human
-# explicitly starts a run from the Actions tab.
+# explicitly starts a run from the Actions tab. Stage 1 does not deploy.
 #
 # Required repository secrets (Settings -> Secrets and variables -> Actions):
 #   LIVEKIT_URL        wss://<project>.livekit.cloud
 #   LIVEKIT_API_KEY    LiveKit Cloud project API key
 #   LIVEKIT_API_SECRET LiveKit Cloud project API secret
-#   SECRET_LIST        PHONIC_API_KEY=<your phonic key>
+#   SECRET_LIST        Comma-separated KEY=value pairs, at minimum:
+#                        DEEPSLATE_VENDOR_ID=...
+#                        DEEPSLATE_ORGANIZATION_ID=...
+#                        DEEPSLATE_API_KEY=...
+#                      plus ONE voice option:
+#                        DEEPSLATE_VOICE_ID=...
+#                      or:
+#                        ELEVENLABS_API_KEY=...,ELEVENLABS_VOICE_ID=...
 #
 # Secret values are never printed and never written into the repository.
 name: Deploy LiveKit Cloud Agent
@@ -132,14 +139,28 @@ jobs:
               ;;
           esac
 
-          # The agent needs PHONIC_API_KEY at runtime; without it every session
-          # fails. Only the secret name is reported.
+          # The agent needs all three Deepslate credentials at runtime; without
+          # them every session fails. A voice output is also required, or the
+          # plugin advertises no audio. Only secret names are reported.
+          for required in DEEPSLATE_VENDOR_ID DEEPSLATE_ORGANIZATION_ID DEEPSLATE_API_KEY; do
+            case "$SECRET_LIST" in
+              *"$required="*) echo "SECRET_LIST provides $required." ;;
+              *)
+                echo "::error::SECRET_LIST must contain $required=<value> in KEY=value form."
+                exit 1
+                ;;
+            esac
+          done
+
           case "$SECRET_LIST" in
-            *PHONIC_API_KEY=*)
-              echo "SECRET_LIST provides PHONIC_API_KEY."
+            *DEEPSLATE_VOICE_ID=*)
+              echo "SECRET_LIST provides DEEPSLATE_VOICE_ID (Deepslate-hosted TTS)."
+              ;;
+            *ELEVENLABS_API_KEY=*ELEVENLABS_VOICE_ID=*)
+              echo "SECRET_LIST provides ElevenLabs TTS credentials."
               ;;
             *)
-              echo "::error::SECRET_LIST must contain PHONIC_API_KEY=<your key> in KEY=value form."
+              echo "::error::SECRET_LIST must contain DEEPSLATE_VOICE_ID=<id>, or both ELEVENLABS_API_KEY=<key> and ELEVENLABS_VOICE_ID=<id>. Without server-side TTS the agent produces no audio."
               exit 1
               ;;
           esac

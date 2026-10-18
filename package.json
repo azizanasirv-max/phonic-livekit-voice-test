@@ -1,8 +1,8 @@
 {
-  "name": "phonic-livekit-voice-test",
+  "name": "deepslate-livekit-voice-test",
   "version": "0.1.0",
   "private": true,
-  "description": "Minimal real-time speech-to-speech voice agent prototype using Phonic and LiveKit Agents (Node.js)",
+  "description": "Minimal real-time voice agent prototype using Deepslate Opal and LiveKit Agents (Node.js)",
   "type": "module",
   "engines": {
     "node": ">=20.0.0"
@@ -16,13 +16,16 @@
     "download-files": "livekit-agents download-files"
   },
   "dependencies": {
-    "@livekit/agents": "1.9.3",
-    "@livekit/agents-plugin-phonic": "1.9.3",
-    "@livekit/rtc-node": "^1.1.0",
+    "@deepslate-labs/livekit": "0.1.23",
+    "@livekit/agents": "1.9.0",
+    "@livekit/rtc-node": "0.13.35",
     "dotenv": "^18.0.8"
   },
   "devDependencies": {
     "@types/node": "^24.19.2",
     "typescript": "^5.9.3"
+  },
+  "overrides": {
+    "sharp": "0.35.5"
   }
 }

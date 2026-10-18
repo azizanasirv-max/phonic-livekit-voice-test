@@ -1,5 +1,5 @@
 # syntax=docker/dockerfile:1
-# Deployment image for the Phonic + LiveKit voice agent (LiveKit Cloud build).
+# Deployment image for the Deepslate Opal + LiveKit voice agent (LiveKit Cloud build).
 # Based on the official LiveKit Node.js Dockerfile template:
 # https://docs.livekit.io/agents/ops/deployment/builds/
 #
@@ -71,6 +71,7 @@ ENV NODE_ENV=production
 # Run the application.
 # The "start" command tells the worker to connect to LiveKit and begin waiting
 # for jobs. package.json maps `npm start` to `node src/main.ts start`.
-# LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET and PHONIC_API_KEY are NOT
-# baked into the image; LiveKit Cloud injects them as runtime secrets.
+# LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET and the DEEPSLATE_* /
+# ELEVENLABS_* credentials are NOT baked into the image; LiveKit Cloud injects
+# them as runtime secrets.
 CMD ["npm", "start"]
