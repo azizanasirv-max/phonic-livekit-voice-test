@@ -1,24 +1,3 @@
-# =============================================================================
-# PENDING ACTIVATION - this file is intentionally NOT under .github/workflows.
-#
-# The GitHub App used for this change (cline-cloud[bot]) has `contents: write`
-# but not the `workflows` permission, so GitHub rejects any push that creates,
-# updates or deletes a file under .github/workflows:
-#
-#   remote rejected ... (refusing to allow a GitHub App to create or update
-#   workflow `.github/workflows/deploy.yml` without `workflows` permission)
-#
-# A repository administrator must activate this workflow:
-#   1. copy this file to .github/workflows/deploy.yml
-#   2. delete .github/workflows/phonic-deploy.yml and .github/workflows/deploy.yml.
-#   3. commit and push with a token that has the `workflows` permission
-#   4. run "Deploy LiveKit Cloud Agent" from the Actions tab
-#
-# See deployment/README.md. Until then the previous workflow remains active and
-# must not be dispatched: it supplies the removed provider's secret and would
-# deploy this code without the required Deepslate configuration.
-# =============================================================================
-
 # Deploy a new version of the EXISTING Deepslate Opal LiveKit Cloud agent.
 #
 # Identity comes from the committed livekit.toml:
