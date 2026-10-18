@@ -86,6 +86,8 @@ export function safeEnvSummary(env: EnvLike = process.env): Record<string, strin
     LIVEKIT_API_SECRET: maskSecret(readEnv('LIVEKIT_API_SECRET', env)),
     PHONIC_VOICE: readEnv('PHONIC_VOICE', env) ?? '(not set)',
     PHONIC_MIN_WORDS_TO_INTERRUPT: readEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', env) ?? '(not set)',
+    PHONIC_VAD_MIN_SPEECH_MS: readEnv('PHONIC_VAD_MIN_SPEECH_MS', env) ?? '(not set)',
+    PHONIC_VAD_MIN_SILENCE_MS: readEnv('PHONIC_VAD_MIN_SILENCE_MS', env) ?? '(not set)',
     LIVEKIT_AGENT_NAME: readEnv('LIVEKIT_AGENT_NAME', env) ?? '(not set)',
   };
 }
@@ -119,6 +121,20 @@ export function readIntEnv(
   if (raw === undefined) return fallback;
   const parsed = Number.parseInt(raw, 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : fallback;
+}
+
+/**
+ * Parse an optional integer env override.
+ *
+ * Returns `undefined` both when the variable is unset and when it is set to
+ * something unparseable, so a typo can never silently apply a wrong number:
+ * either way the provider's own default is used.
+ */
+export function readOptionalIntEnv(name: string, env: EnvLike = process.env): number | undefined {
+  const raw = readEnv(name, env);
+  if (raw === undefined) return undefined;
+  const parsed = Number.parseInt(raw, 10);
+  return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 /** Hostnames that mean "a LiveKit server running locally". */

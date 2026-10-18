@@ -11,6 +11,7 @@ import {
   maskSecret,
   readEnv,
   readIntEnv,
+  readOptionalIntEnv,
   redactSecrets,
   safeEnvSummary,
   validateLivekitUrl,
@@ -117,6 +118,21 @@ describe('readIntEnv', () => {
     assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: '4' }), 4);
     assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: 'abc' }), 2);
     assert.equal(readIntEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', 2, { PHONIC_MIN_WORDS_TO_INTERRUPT: '-1' }), 2);
+  });
+});
+
+describe('readOptionalIntEnv', () => {
+  it('returns a parsed value only when one is configured', () => {
+    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', {}), undefined);
+    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '  ' }), undefined);
+    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '0' }), 0);
+    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '250' }), 250);
+  });
+
+  it('treats invalid values as unset so a typo cannot change behaviour', () => {
+    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: 'abc' }), undefined);
+    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '-5' }), undefined);
+    assert.equal(readOptionalIntEnv('PHONIC_VAD_THRESHOLD', { PHONIC_VAD_THRESHOLD: '1.5' }), 1);
   });
 });
 

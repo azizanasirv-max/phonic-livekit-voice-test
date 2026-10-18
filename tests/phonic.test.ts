@@ -12,6 +12,7 @@ import {
   DEFAULT_VOICE,
   createRealtimeModel,
   resolvePhonicOptions,
+  resolvePhonicVadOptions,
 } from '../src/phonic.ts';
 
 const FAKE_KEY = 'ph_test_0000000000000000';
@@ -26,9 +27,20 @@ describe('resolvePhonicOptions', () => {
       voice: DEFAULT_VOICE,
       minWordsToInterrupt: DEFAULT_MIN_WORDS_TO_INTERRUPT,
       isWelcomeMessageInterruptible: true,
+      vadPrebufferDurationMs: undefined,
+      vadMinSpeechDurationMs: undefined,
+      vadMinSilenceDurationMs: undefined,
+      vadThreshold: undefined,
     });
     assert.equal(DEFAULT_VOICE, 'sabrina');
-    assert.equal(DEFAULT_MIN_WORDS_TO_INTERRUPT, 2);
+  });
+
+  it('defaults minWordsToInterrupt to 1 so one word can interrupt', () => {
+    // 1 is Phonic's own default and the earliest interruption it supports.
+    // Raising it makes the assistant keep talking over the start of the user's
+    // interruption, so this default is a behavioural guarantee, not a taste call.
+    assert.equal(DEFAULT_MIN_WORDS_TO_INTERRUPT, 1);
+    assert.equal(resolvePhonicOptions({}).minWordsToInterrupt, 1);
   });
 
   it('honours environment overrides', () => {
@@ -39,6 +51,38 @@ describe('resolvePhonicOptions', () => {
 
     assert.equal(options.voice, 'grant');
     assert.equal(options.minWordsToInterrupt, 3);
+  });
+
+  it('leaves Phonic VAD tuning unset unless it is configured', () => {
+    assert.deepEqual(resolvePhonicVadOptions({}), {
+      vadPrebufferDurationMs: undefined,
+      vadMinSpeechDurationMs: undefined,
+      vadMinSilenceDurationMs: undefined,
+      vadThreshold: undefined,
+    });
+
+    const tuned = resolvePhonicVadOptions({
+      PHONIC_VAD_PREBUFFER_MS: '200',
+      PHONIC_VAD_MIN_SPEECH_MS: '150',
+      PHONIC_VAD_MIN_SILENCE_MS: '500',
+      PHONIC_VAD_THRESHOLD: '0',
+    });
+    assert.deepEqual(tuned, {
+      vadPrebufferDurationMs: 200,
+      vadMinSpeechDurationMs: 150,
+      vadMinSilenceDurationMs: 500,
+      vadThreshold: 0,
+    });
+  });
+
+  it('ignores unparseable VAD values instead of applying a wrong number', () => {
+    const options = resolvePhonicVadOptions({
+      PHONIC_VAD_MIN_SPEECH_MS: 'fast',
+      PHONIC_VAD_MIN_SILENCE_MS: '-50',
+    });
+
+    assert.equal(options.vadMinSpeechDurationMs, undefined);
+    assert.equal(options.vadMinSilenceDurationMs, undefined);
   });
 });
 
@@ -58,6 +102,21 @@ describe('createRealtimeModel', () => {
     assert.equal(model._options.voice, 'virginia');
     assert.equal(model._options.minWordsToInterrupt, 4);
     assert.equal(model._options.isWelcomeMessageInterruptible, true);
+  });
+
+  it('passes Phonic VAD tuning through to the plugin', () => {
+    process.env.PHONIC_API_KEY = FAKE_KEY;
+
+    const model = createRealtimeModel({
+      PHONIC_VAD_MIN_SPEECH_MS: '150',
+      PHONIC_VAD_MIN_SILENCE_MS: '500',
+    });
+
+    assert.equal(model._options.vadMinSpeechDurationMs, 150);
+    assert.equal(model._options.vadMinSilenceDurationMs, 500);
+    // Untouched knobs stay undefined so Phonic's own defaults apply.
+    assert.equal(model._options.vadPrebufferDurationMs, undefined);
+    assert.equal(model._options.vadThreshold, undefined);
   });
 
   it('forwards the conversation-created callback', () => {

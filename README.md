@@ -66,7 +66,11 @@ npm run check:env        # masked summary + LIVEKIT_URL scheme check; exits non-
 | `LIVEKIT_API_KEY` | **Yes** | **Yes** | LiveKit Cloud → Project settings → Keys |
 | `LIVEKIT_API_SECRET` | **Yes** | **Yes** | LiveKit Cloud → Project settings → Keys (same page) |
 | `PHONIC_VOICE` | No | No | Default `sabrina`. Documented voices: `sabrina`, `grant`, `virginia`, `landon`, `eleanor`, `shelby`, `nolan` |
-| `PHONIC_MIN_WORDS_TO_INTERRUPT` | No | No | Default `2`. Minimum words the user must say to interrupt the agent |
+| `PHONIC_MIN_WORDS_TO_INTERRUPT` | No | No | Default `1`. Minimum words the user must say to interrupt the agent. Raise it only if backchannel noises interrupt too often — it directly lengthens the overlap on every interruption (section 5) |
+| `PHONIC_VAD_MIN_SPEECH_MS` | No | No | Unset by default (Phonic's own value applies). Phonic `vad_min_speech_duration_ms` — how much speech must accumulate before speech onset is reported |
+| `PHONIC_VAD_MIN_SILENCE_MS` | No | No | Unset by default. Phonic `vad_min_silence_duration_ms` — silence needed before the user's turn is considered finished |
+| `PHONIC_VAD_PREBUFFER_MS` | No | No | Unset by default. Phonic `vad_prebuffer_duration_ms` — audio kept before speech onset |
+| `PHONIC_VAD_THRESHOLD` | No | No | Unset by default. Phonic `vad_threshold` — VAD sensitivity |
 | `LIVEKIT_AGENT_NAME` | No | No | Unset by default → automatic dispatch. Set it to enable explicit dispatch |
 
 `.env` is gitignored. `.env.example` contains placeholders only. Never commit real credentials.
@@ -115,17 +119,83 @@ transport. Only `PHONIC_API_KEY` is needed for this mode.
 
 ## 5. How interruption works
 
-Interruption is handled by Phonic's own turn detection, not by extra code here. The plugin exposes
-documented options that are wired up in `src/phonic.ts`:
+Interruption is handled by Phonic's own turn detection, not by extra code here. This section
+documents the whole lifecycle, what this repository does about it, and the one part it cannot fix.
 
-- `minWordsToInterrupt: 2` (overridable via `PHONIC_MIN_WORDS_TO_INTERRUPT`) — the user must say at
-  least two words before the agent is interrupted, so short acknowledgements like "uh" or "hmm"
-  don't cut the agent off.
-- `isWelcomeMessageInterruptible: true` — you can talk over the opening greeting.
+### 5.1 The lifecycle, step by step
 
-There is **no** code that calls an interrupt method; interruption happens on Phonic's side when it
-detects user speech that clears the word threshold. The agent prompt (`src/instructions.ts`) also
-tells the model to stop talking and listen, and not to treat backchannel as a new question.
+1. **Phonic detects the user's speech.** Its server-side VAD (tuned with `vad_*`) decides the user
+   has started talking and emits `user_started_speaking`.
+2. **The plugin forwards it.** `handleInputSpeechStarted()` emits LiveKit's `input_speech_started`
+   and *then* closes the active generation, which closes that generation's audio and text streams.
+3. **LiveKit stops the old response.** `AgentActivity.onInputSpeechStarted` calls
+   `interrupt({ source: 'audio_activity' })`, which interrupts the active `SpeechHandle` and aborts
+   the task forwarding that response's audio.
+4. **Already-buffered audio is dropped, in the agent.** The interrupted branch of the realtime
+   generation calls `audioOutput.clearBuffer()`, and the room audio output implements it by
+   bumping an interruption generation counter (frames captured after that are discarded) and
+   clearing the `AudioSource` queue. `tests/interruption.test.ts` asserts this against the real SDK.
+5. **The next response starts clean.** Phonic opens a new generation, LiveKit creates a new
+   `SpeechHandle`, and the previous response can no longer deliver audio.
+
+### 5.2 What this repository configures
+
+`src/phonic.ts` (model options) and `src/session.ts` (turn-handling policy):
+
+| Setting | Value | Why |
+| --- | --- | --- |
+| `minWordsToInterrupt` | **`1`** (was `2`) | Phonic will not stop the assistant until the user has spoken this many words. At `2` the assistant keeps generating and streaming audio for the whole first word of every interruption — the main cause of "it keeps talking over me". `1` is Phonic's own default and the earliest interruption it supports. Override with `PHONIC_MIN_WORDS_TO_INTERRUPT`. |
+| `isWelcomeMessageInterruptible` | `true` | You can talk over the opening greeting. |
+| `turnHandling.turnDetection` | `'realtime_llm'` | Pinned so Phonic's server-side turn detection stays in charge and cannot be replaced by a client-side VAD or turn detector. |
+| `turnHandling.interruption.resumeFalseInterruption` | `false` | A guard, not a fix: LiveKit's default (`true`, with a 2 s timeout) lets a user utterance it treats as a false interruption *pause* the agent's audio and **resume it later**, replaying the buffered remainder of the old response after the user has spoken. That path is driven by LiveKit's client-side interruption detection, which is inactive while Phonic owns turn detection, so it is not what you are hearing today — but pinning it off means an interruption can never be turned into a deferred replay. |
+| `turnHandling.interruption.minWords` / `minDuration` | `0` / `0` | Phonic already gates interruptions server-side; a second client-side threshold would only delay the stop. |
+
+`PHONIC_VAD_*` (`PHONIC_VAD_MIN_SPEECH_MS`, `PHONIC_VAD_MIN_SILENCE_MS`,
+`PHONIC_VAD_PREBUFFER_MS`, `PHONIC_VAD_THRESHOLD`) expose Phonic's documented VAD knobs. They are
+**unset by default** so Phonic's own tuned values apply; they exist because lowering
+`vad_min_speech_duration_ms` is the only supported way to make Phonic report speech onset earlier
+(and therefore stop the assistant earlier) without changing the interruption word count. Tune them
+against real recordings, not by guesswork.
+
+### 5.3 Where the old audio actually continues — and the precise limitation
+
+The installed plugin (`@livekit/agents-plugin-phonic@1.9.3`) does **not** cancel or truncate audio
+already generated: `interrupt()`, `clearAudio()` and `truncate()` are no-ops that only log a
+warning, and its declared capability `messageTruncation` is `false`. It also hardcodes Phonic's
+`stream_ahead_of_real_time: true`, which tells Phonic to send the assistant's audio as fast as it is
+generated rather than paced to real time. There is no supported option to change either behaviour,
+and this repository does not patch the SDK.
+
+Where audio can be stopped, and where it cannot:
+
+| Layer | Can an interruption stop it? |
+| --- | --- |
+| Phonic generation | Yes, on Phonic's side — but only once Phonic decides the user is speaking. |
+| The plugin's generation streams | Yes — the generation is closed, so later chunks are dropped. |
+| LiveKit's agent-side playback queue | **Yes** — `clearBuffer()` clears the `AudioSource` queue and discards frames captured after the interruption. |
+| WebRTC transmission | No — packets already sent cannot be recalled. |
+| Caller's playback / jitter buffer | No — it is inside the client, which the agent cannot reach. |
+
+So the residual overlap is the audio that had already left the agent plus whatever the caller has
+buffered, and it grows with (a) how long Phonic takes to decide the user is speaking and (b) how far
+ahead of real time Phonic has already streamed. With `stream_ahead_of_real_time: true` forced by the
+plugin, that backlog is deeper than with real-time pacing.
+
+**Conclusion:** the agent-side queue *is* flushed, so an interrupted response can never be
+*scheduled* again — that is asserted by the regression tests. But the last few hundred milliseconds
+already in flight, and anything sitting in the caller's playback buffer, cannot be recalled from
+this side of the connection. This repository therefore shrinks the window rather than claiming the
+residual tail is gone. If the remaining tail is too large in practice, the fix has to be in the
+plugin (expose `stream_ahead_of_real_time`, or implement `truncate()`), and this project deliberately
+does not work around that with monkey-patching.
+
+### 5.4 The one thing to watch
+
+A single-word threshold means backchannel noises ("hmm", "uh") can now interrupt the agent, because
+Phonic decides. The prompt in `src/instructions.ts` tells the model how to treat backchannel once it
+is listening, and `PHONIC_MIN_WORDS_TO_INTERRUPT=2` restores the old behaviour if false
+interruptions are worse than the overlap for your microphone and accent. The agent logs a warning at
+startup whenever that value is greater than 1.
 
 ---
 
@@ -149,16 +219,30 @@ npm run typecheck   # must pass cleanly
 npm test
 ```
 
-`npm test` runs 27 unit tests in three files. **None of them make network requests or call a paid
+`npm test` runs 46 unit tests in five files. **None of them make network requests or call a paid
 API:**
 
 | File | Covers |
 | --- | --- |
-| `tests/config.test.ts` | Env validation, missing-variable reporting, credential masking/redaction, `LIVEKIT_URL` scheme validation |
+| `tests/config.test.ts` | Env validation, missing-variable reporting, credential masking/redaction, `LIVEKIT_URL` scheme validation, optional integer parsing |
 | `tests/instructions.test.ts` | The prompt is concise and contains the interruption/backchannel rules |
-| `tests/phonic.test.ts` | The Phonic model is constructed with the documented options and fails cleanly without a key |
+| `tests/phonic.test.ts` | The Phonic model is constructed with the documented options (including `minWordsToInterrupt: 1` and the optional VAD knobs) and fails cleanly without a key |
+| `tests/session.test.ts` | The turn-handling policy: server-side turn detection pinned, interruptions on, no resume of interrupted audio |
+| `tests/interruption.test.ts` | The interruption lifecycle against the **real** LiveKit `AgentSession` |
 
-There is **no automated end-to-end voice test**: verifying real audio requires a paid Phonic
+`tests/interruption.test.ts` is the regression suite for this fix. It runs the real SDK's realtime
+generation, interruption and audio-playback code with only Phonic replaced
+(`tests/fake-phonic-realtime.ts`, which mirrors the installed plugin's declared capabilities and
+event order). It covers: a one-word interruption, an interruption mid-generation, buffered audio
+from a cancelled response never being scheduled, a new response starting afterwards, repeated
+interruptions without duplicated or overlapping responses, and recovery after a Phonic disconnect
+and after a session close.
+
+`fake-phonic-realtime.ts` is a test double, not a mock of Phonic's network protocol: it does not
+invent capabilities the installed plugin does not have, and `interrupt()`, `clearAudio()` and
+`truncate()` are no-ops there too, because they are no-ops in the plugin.
+
+There is still **no automated end-to-end voice test**: verifying real audio requires a paid Phonic
 conversation plus a human microphone, so it stays manual (section 8).
 
 ### Build and test results (this repository, Node v24.15.0)
@@ -166,7 +250,7 @@ conversation plus a human microphone, so it stays manual (section 8).
 | Check | Command | Result |
 | --- | --- | --- |
 | Type check | `npm run typecheck` | ✅ 0 errors |
-| Unit tests | `npm test` | ✅ 27 passed / 0 failed |
+| Unit tests | `npm test` | ✅ 46 passed / 0 failed |
 | Agent boots | `node src/main.ts dev` | ✅ Worker starts, binds a random port, then retries the LiveKit connection |
 | Connection error path | `node src/main.ts dev` with an unreachable `LIVEKIT_URL` | ✅ Clear `failed to connect to LiveKit server (ws://127.0.0.1:7880), retrying in 2 seconds: (1/10)` messages |
 | Missing config path | `npm run check:env` with no `.env` | ✅ Exits `1` with `Missing required environment variable(s): PHONIC_API_KEY, LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET` |
@@ -184,14 +268,17 @@ Run through this yourself once real credentials are in place. Record what actual
 | 1 | Agent starts successfully | `npm run dev` → expect `starting worker`, no retry loop, then a successful registration | ☐ |
 | 2 | You can connect and hold a voice conversation | Join a room (section 4A or 4B), allow the mic, hear the greeting | ☐ |
 | 3 | Agent responds coherently across multiple turns | Ask 4–5 related follow-up questions | ☐ |
-| 4 | You can interrupt the agent mid-sentence | Start speaking while it is talking; it should stop and listen | ☐ |
+| 4 | You can interrupt the agent mid-sentence with one word | Start speaking while it is talking; it should stop and listen | ☐ |
 | 5 | You can ask a question while the agent is speaking | Interrupt with a full question, e.g. "what's the weather like today?" | ☐ |
-| 6 | No self-interruption or false triggers on acknowledgements | While the agent talks, say "uh-huh" / "hmm"; it should keep going | ☐ |
-| 7 | Conversation stable for several minutes | Talk for 5+ minutes, check for drops, hangs, or a frozen session | ☐ |
-| 8 | Errors are understandable and credentials stay private | Break one value in `.env` on purpose; check the message is actionable and no key appears in the log | ☐ |
+| 6 | No audible tail after an interruption | Interrupt, then stay silent: no fragment of the old reply should play after the agent stops | ☐ |
+| 7 | No self-interruption or false triggers on acknowledgements | While the agent talks, say "uh-huh" / "hmm"; it should keep going | ☐ |
+| 8 | Conversation stable for several minutes | Talk for 5+ minutes, check for drops, hangs, or a frozen session | ☐ |
+| 9 | Errors are understandable and credentials stay private | Break one value in `.env` on purpose; check the message is actionable and no key appears in the log | ☐ |
 
-For checks 4–6, raise `PHONIC_MIN_WORDS_TO_INTERRUPT` (e.g. to `3`) if the agent is being
-interrupted too easily, or set it to `1` if it is too hard to interrupt.
+For checks 4–7, raise `PHONIC_MIN_WORDS_TO_INTERRUPT` (e.g. to `2` or `3`) if the agent is being
+interrupted too easily — the default is `1`, the earliest interruption Phonic supports. Check 6 is
+the one this repository cannot fully fix: see section 5.3 for why, and use it to judge how large the
+residual tail actually is on your device before deciding whether it needs a plugin change upstream.
 
 ---
 
@@ -210,7 +297,10 @@ interrupted too easily, or set it to `1` if it is too hard to interrupt.
 | Agent starts but nobody joins the room | With `LIVEKIT_AGENT_NAME` set, dispatch is explicit — the room token must request that agent name, otherwise the agent is never assigned. Unset it for automatic dispatch. |
 | Agent joins but you hear nothing | Check microphone permission in the browser/terminal, that you joined the same room, and that the Phonic conversation was created (look for `phonic conversation created` in the logs). |
 | Type-stripping errors when running `node src/main.ts` | Node is too old. Use Node >= 22.18 (Node 24 LTS recommended). |
-| Connection drops mid-conversation | Check `session error` log lines; Phonic/network hiccups surface there. Re-run with `--log-level DEBUG` for more detail. |
+| Connection drops mid-conversation | Check `session error` log lines; Phonic/network hiccups surface there. Re-run with `--log-level DEBUG` for more detail. An abnormal Phonic socket close is reported as unrecoverable, so LiveKit ends that session; the next job starts a fresh one. |
+| The agent talks over you when you interrupt | `minWordsToInterrupt` is above `1` (the startup log warns about this), or Phonic's VAD is reporting speech onset late. Lower `PHONIC_MIN_WORDS_TO_INTERRUPT` to `1` and consider `PHONIC_VAD_MIN_SPEECH_MS`. See section 5. |
+| A short fragment of the old reply still plays after you interrupt | This is the residual, unflushable audio tail described in section 5.3 (audio already sent over RTP plus the caller's own buffer). The agent-side queue is flushed, so nothing can be *re-scheduled*; if the tail is long enough to matter, it needs a plugin-side change upstream. |
+| The agent is interrupted by "uh-huh" / "hmm" | Expected with the `1`-word default, because Phonic decides. Raise `PHONIC_MIN_WORDS_TO_INTERRUPT` to `2` and accept the longer overlap. |
 
 ---
 
@@ -373,12 +463,14 @@ package.json        Dependencies and scripts
 tsconfig.json       Type-check configuration (NodeNext, strict, no emit)
 src/main.ts         Agent entry point: defineAgent + AgentSession + Phonic model + cli.runApp
 src/phonic.ts       Phonic RealtimeModel construction and option resolution
+src/session.ts      AgentSession factory + the turn-handling / interruption policy
 src/agent.ts        Builds the LiveKit voice.Agent
 src/instructions.ts Agent prompt (concise, interruption/backchannel aware)
 src/config.ts       Env reading, validation, masking, redaction
 src/logging.ts      Redacted console logging helpers
 src/check-env.ts    `npm run check:env` preflight check
 tests/*.test.ts     Unit tests (no network, no paid calls)
+tests/fake-phonic-realtime.ts   Test double for the Phonic model boundary
 ```
 
 ---
@@ -392,10 +484,22 @@ tests/*.test.ts     Unit tests (no network, no paid calls)
    apply to the Live Conversation API used here, is not stated on the pricing page.
 3. **LiveKit Cloud free-tier limits** — the exact free connection-minute allowance for agent
    sessions was not verified here; check the LiveKit pricing page for your project.
-4. **`minWordsToInterrupt` tuning** — the default of `2` is a judgement call. The right value for
-   your microphone, language, and speaking style needs the manual checklist (item 6) to confirm.
-5. **`lk agent console` / Agent Console compatibility** — both are documented for locally running
+4. **`minWordsToInterrupt` tuning** — the default is now `1` (Phonic's own default and the earliest
+   interruption it supports), chosen because `2` demonstrably makes the assistant talk over the start
+   of every interruption. Whether `1` produces too many false interruptions for your microphone,
+   language, and speaking style still needs the manual checklist (item 6) to confirm;
+   `PHONIC_MIN_WORDS_TO_INTERRUPT=2` restores the previous behaviour.
+5. **The unflushable audio tail** — audio already transmitted over RTP and buffered in the caller's
+   playback path cannot be recalled by the agent (section 5.3). The plugin hardcodes
+   `stream_ahead_of_real_time: true` and does not implement `truncate()`, so the size of that tail
+   cannot be reduced from this repository. Measuring it needs client-side playback instrumentation,
+   which the Stage 0 diagnostics branch (`src/diagnostics.ts`, a separate branch) does not provide
+   either — it only samples the agent's peer connection.
+6. **Phonic VAD defaults** — the `vad_*` values Phonic applies when they are left unset are not
+   published, so `PHONIC_VAD_*` is exposed without a recommended starting value. Set them from
+   recordings, not from guesswork.
+7. **`lk agent console` / Agent Console compatibility** — both are documented for locally running
    agents, but neither was executed here (no microphone, and the LiveKit CLI is not installed in the
    build environment). Treat options A and B in section 4 as untested paths.
-6. **Phonic model version** — the plugin defaults to the Phonic model `merritt`; whether a newer
+8. **Phonic model version** — the plugin defaults to the Phonic model `merritt`; whether a newer
    `phonicModel` (`phonic_v1` / `phonic_v1_1`) gives better interruption behavior was not evaluated.
