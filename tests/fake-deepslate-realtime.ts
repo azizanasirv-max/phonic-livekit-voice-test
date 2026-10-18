@@ -1,44 +1,44 @@
 /**
- * Test doubles for the Phonic ↔ LiveKit boundary.
+ * Test doubles for the Deepslate Opal ↔ LiveKit boundary.
  *
  * The interruption tests run against the **real** `AgentSession`,
  * `RealtimeModel`/`RealtimeSession` base classes and audio-output contract from
- * the installed `@livekit/agents`; only Phonic itself is replaced. The fake
- * reproduces exactly what the installed plugin
- * (`@livekit/agents-plugin-phonic@1.9.3`) does at that boundary and nothing
- * more, so the tests exercise LiveKit's real behaviour rather than invented
- * capabilities:
+ * the installed `@livekit/agents`; only Deepslate itself is replaced. The fake
+ * reproduces what `@deepslate-labs/livekit@0.1.23` does at that boundary (see
+ * `src/realtime/model.ts` in the published package), and nothing more:
  *
- * - Declared capabilities are copied from the plugin's `super({...})` call
- *   (`src/realtime/realtime_model.ts`): `turnDetection: true`, `audioOutput:
- *   true`, `messageTruncation: false`, `supportsOverlappingSpeech` unset (so
- *   LiveKit treats the model as non-overlapping and interrupts it on
- *   `input_speech_started`).
- * - One assistant turn = one `GenerationCreatedEvent` carrying one message with
- *   an audio stream and a text stream (`startNewAssistantTurn`).
- * - `handleInputSpeechStarted`: Phonic's `user_started_speaking` emits
- *   `input_speech_started` **and then** closes the open turn
- *   (`closeCurrentGeneration({ interrupted: true })`). The emit happens first —
- *   that ordering is what lets LiveKit interrupt the in-flight response.
- * - `handleAudioChunk`: audio for a turn that is already closed is dropped, and
- *   audio arriving with no open turn does nothing unless it carries text (which
- *   starts a new turn).
- * - `interrupt()`, `clearAudio()` and `truncate()` are no-ops that only warn:
- *   the plugin does not cancel or truncate server-side audio, so tests must not
- *   pretend they do.
+ * - Capabilities are copied from the plugin's `super({...})` call:
+ *   `messageTruncation: true`, `turnDetection: true`, `userTranscription: true`,
+ *   `autoToolReplyGeneration: true`, `audioOutput: true` (a TTS config is
+ *   configured), `manualFunctionCalls: false`, `perResponseToolChoice: false`.
+ * - A response is one `GenerationCreatedEvent` with an audio stream and a text
+ *   stream. The plugin opens one whenever the server begins a response
+ *   (`responseBegin` / the first `audioChunk` / `textFragment`).
+ * - `playbackBufferClear` (Deepslate's server-side VAD detected the caller
+ *   speaking) emits `input_speech_started` and then closes the current
+ *   generation — unless it is an `uninterruptable` direct-speech utterance,
+ *   which the plugin deliberately leaves alone.
+ * - `interrupt()` closes the current generation; `clearAudio()` is a no-op and
+ *   `truncate()` is a no-op. Both only log in the plugin: Deepslate cancels and
+ *   truncates server-side.
+ * - Late `audioChunk`s are **not** filtered by the plugin. `ensureGeneration()`
+ *   opens a new generation, so audio the server still had in flight can be
+ *   scheduled again. Tests must not pretend otherwise.
+ * - Provider errors are emitted with `recoverable: false`, which makes
+ *   LiveKit tear the session down.
  */
 import { AudioFrame } from '@livekit/rtc-node';
 import { llm, voice } from '@livekit/agents';
 import { ReadableStream } from 'node:stream/web';
 
-/** Phonic's output format is `pcm_24000`, mono (see the plugin's constants). */
-export const PHONIC_SAMPLE_RATE = 24000;
-/** 20 ms at 24 kHz — the chunk size Phonic streams. */
-export const PHONIC_FRAME_SAMPLES = 480;
+/** Deepslate session default input/output rate (24 kHz, mono). */
+export const DEEPSLATE_SAMPLE_RATE = 24000;
+/** 20 ms at 24 kHz. */
+export const DEEPSLATE_FRAME_SAMPLES = 480;
 
 /** A silent 20 ms frame, enough for the playback path to accept it. */
-export function pcmFrame(samples: number = PHONIC_FRAME_SAMPLES): AudioFrame {
-  return new AudioFrame(new Int16Array(samples), PHONIC_SAMPLE_RATE, 1, samples);
+export function pcmFrame(samples: number = DEEPSLATE_FRAME_SAMPLES): AudioFrame {
+  return new AudioFrame(new Int16Array(samples), DEEPSLATE_SAMPLE_RATE, 1, samples);
 }
 
 type TurnCloseReason = 'interrupted' | 'completed';
@@ -49,6 +49,7 @@ type FakeTurn = {
   text?: ReadableStreamDefaultController<string>;
   audioClosed: boolean;
   textClosed: boolean;
+  uninterruptable: boolean;
 };
 
 function closedStream<T>(): ReadableStream<T> {
@@ -59,7 +60,7 @@ function closedStream<T>(): ReadableStream<T> {
   });
 }
 
-/** Close a stream controller, tolerating one that the consumer already closed. */
+/** Close a stream controller, tolerating one the consumer already closed. */
 function closeController<T>(controller: ReadableStreamDefaultController<T> | undefined): void {
   if (controller === undefined) return;
   try {
@@ -69,24 +70,24 @@ function closeController<T>(controller: ReadableStreamDefaultController<T> | und
   }
 }
 
-/** Stand-in for the plugin's `RealtimeSession`. */
-export class FakePhonicRealtimeSession extends llm.RealtimeSession {
+/** Stand-in for the plugin's `DeepslateRealtimeSession`. */
+export class FakeDeepslateRealtimeSession extends llm.RealtimeSession {
   chatCtx: llm.ChatContext = llm.ChatContext.empty();
   tools: llm.ToolContext = llm.ToolContext.empty();
 
-  /** Assistant turns opened so far. */
+  /** Responses opened so far. */
   turnsOpened = 0;
-  /** Turns closed because Phonic reported user speech (an interruption). */
+  /** Responses closed because Deepslate reported user speech. */
   turnsInterrupted = 0;
-  /** Turns that ran to `assistant_finished_speaking`. */
+  /** Responses that ran to `responseEnd`. */
   turnsCompleted = 0;
-  /** Frames the fake handed to a turn that was still open. */
+  /** Frames the fake handed to an open response. */
   framesDelivered = 0;
-  /** Frames dropped because the turn they belonged to was already closed. */
+  /** Frames dropped because the consumer had cancelled the stream. */
   framesDropped = 0;
   /** LiveKit called the model's `clearAudio()` (a no-op in the plugin). */
   clearAudioCalls = 0;
-  /** LiveKit called the model's `interrupt()` (a no-op in the plugin). */
+  /** LiveKit called the model's `interrupt()` (closes the local generation). */
   interruptCalls = 0;
   /** LiveKit called the model's `truncate()` (a no-op in the plugin). */
   truncateCalls = 0;
@@ -109,28 +110,32 @@ export class FakePhonicRealtimeSession extends llm.RealtimeSession {
 
   pushAudio(): void {}
 
-  /** Mirrors the plugin's `generateReply()`: close any open turn, open a new one. */
+  /** Mirrors the plugin's `generateReply()`: close any open response, open one. */
   async generateReply(): Promise<llm.GenerationCreatedEvent> {
     if (this.closed) {
       throw new Error('session is closed');
     }
-    this.#closeTurn('interrupted');
-    return this.#openTurn({ userInitiated: true });
+    // The real plugin resolves when the server's response begins; the fake
+    // opens it immediately so tests are deterministic.
+    this.#closeTurn('completed');
+    return this.#openTurn({ userInitiated: true, uninterruptable: false });
   }
 
-  /** Mirrors `handleAudioChunk` opening a turn for a Phonic-initiated reply. */
-  assistantTurnFromPhonic(): llm.GenerationCreatedEvent {
-    return this.#openTurn({ userInitiated: false });
+  /** Mirrors a server-initiated response (reply to caller audio). */
+  assistantTurnFromServer(): llm.GenerationCreatedEvent {
+    return this.#openTurn({ userInitiated: false, uninterruptable: false });
   }
 
   /**
-   * Mirrors `handleAudioChunk`: deliver one frame (and optional text) to the
-   * open turn. Returns false when there is no open turn or it is already
-   * closed, which is what the plugin does for late chunks.
+   * Mirrors the plugin's `audioChunk` handler, which calls
+   * `ensureGeneration()`: audio arriving with no open response opens a new one.
    */
   pushAssistantAudio(text = ''): boolean {
-    const turn = this.#turn;
-    if (turn === undefined || turn.audioClosed) {
+    if (this.#turn === undefined) {
+      this.#openTurn({ userInitiated: false, uninterruptable: false });
+    }
+    const turn = this.#turn!;
+    if (turn.audioClosed) {
       this.framesDropped += 1;
       return false;
     }
@@ -147,57 +152,51 @@ export class FakePhonicRealtimeSession extends llm.RealtimeSession {
     return true;
   }
 
-  /** Mirrors `assistant_finished_speaking` → `finishAssistantTurn()`. */
+  /** Mirrors `responseEnd` → `closeCurrentGeneration()`. */
   finishAssistantTurn(): void {
     this.#closeTurn('completed');
   }
 
   /**
-   * Mirrors Phonic's `user_started_speaking` → `handleInputSpeechStarted()`:
-   * notify LiveKit first, then close the turn.
+   * Mirrors `playbackBufferClear` → `handleInputSpeechStarted()`: notify
+   * LiveKit first, then close the response. An uninterruptable direct-speech
+   * utterance is left playing, exactly as the plugin does.
    */
   userStartedSpeaking(): void {
+    if (this.#turn?.uninterruptable === true) return;
     this.emit('input_speech_started', {});
     this.#closeTurn('interrupted');
   }
 
-  /** Mirrors `user_finished_speaking` → `handleInputSpeechStopped()`. */
+  /** Mirrors the plugin's user-turn boundary after an interruption. */
   userFinishedSpeaking(): void {
     this.emit('input_speech_stopped', { userTranscriptionEnabled: true });
   }
 
-  /**
-   * Reports user speech *without* closing the generation — the worst case a
-   * provider can present: frames already buffered in the generation's audio
-   * stream stay readable, so LiveKit itself has to stop scheduling them.
-   */
-  userStartedSpeakingKeepingTurnOpen(): void {
-    this.emit('input_speech_started', {});
+  /** Mirrors the plugin's `speakDirect()` for an uninterruptable utterance. */
+  async speakDirectUninterruptable(text: string): Promise<void> {
+    this.#openTurn({ userInitiated: false, uninterruptable: true });
+    this.pushAssistantAudio(text);
   }
 
-  /**
-   * Mirrors the plugin's socket `close` handler: drop the open generation and
-   * report an abnormal close as an error (1000 is a normal close).
-   */
-  simulateSocketClose(code = 1006): void {
+  /** Mirrors a non-recoverable provider error (plugin emits `recoverable: false`). */
+  simulateProviderError(message = 'Deepslate connection failed'): void {
     this.#closeTurn('completed');
-    if (!this.closed && code !== 1000) {
-      this.emit('error', {
-        type: 'realtime_model_error',
-        timestamp: Date.now(),
-        label: 'phonic_realtime',
-        error: new Error(`Phonic STS socket closed with code ${code}`),
-        recoverable: false,
-      } satisfies llm.RealtimeModelError);
-    }
+    this.emit('error', {
+      type: 'realtime_model_error',
+      timestamp: Date.now(),
+      label: 'deepslate.RealtimeModel',
+      error: new Error(message),
+      recoverable: false,
+    } satisfies llm.RealtimeModelError);
   }
 
-  /** True while an assistant turn is open (Phonic is still speaking). */
+  /** True while a response is open (the model is still speaking). */
   get turnOpen(): boolean {
     return this.#turn !== undefined;
   }
 
-  /** True when LiveKit cancelled the open turn's audio stream. */
+  /** True when LiveKit cancelled the open response's audio stream. */
   get audioStreamCancelled(): boolean {
     return this.#audioCancelledByConsumer;
   }
@@ -208,20 +207,21 @@ export class FakePhonicRealtimeSession extends llm.RealtimeSession {
     await super.close();
   }
 
-  /** No-op, exactly like the plugin (which only logs a warning). */
+  /** Mirrors the plugin: server-side VAD auto-commits audio. */
   async commitAudio(): Promise<void> {}
 
-  /** No-op, exactly like the plugin. */
+  /** Mirrors the plugin: logs a warning and does nothing. */
   async clearAudio(): Promise<void> {
     this.clearAudioCalls += 1;
   }
 
-  /** No-op, exactly like the plugin. */
+  /** Mirrors the plugin's `interrupt()`: closes the local generation. */
   async interrupt(): Promise<void> {
     this.interruptCalls += 1;
+    this.#closeTurn('interrupted');
   }
 
-  /** No-op, exactly like the plugin. */
+  /** Mirrors the plugin: Deepslate truncates context server-side. */
   async truncate(): Promise<void> {
     this.truncateCalls += 1;
   }
@@ -238,12 +238,20 @@ export class FakePhonicRealtimeSession extends llm.RealtimeSession {
     turn.textClosed = true;
   }
 
-  #openTurn({ userInitiated }: { userInitiated: boolean }): llm.GenerationCreatedEvent {
+  #openTurn({
+    userInitiated,
+    uninterruptable,
+  }: {
+    userInitiated: boolean;
+    uninterruptable: boolean;
+  }): llm.GenerationCreatedEvent {
+    this.#closeTurn('completed');
     this.turnsOpened += 1;
     const turn: FakeTurn = {
-      responseId: `PS_fake_${this.turnsOpened}`,
+      responseId: `DS_fake_${this.turnsOpened}`,
       audioClosed: false,
       textClosed: false,
+      uninterruptable,
     };
     this.#audioCancelledByConsumer = false;
 
@@ -280,39 +288,38 @@ export class FakePhonicRealtimeSession extends llm.RealtimeSession {
       responseId: turn.responseId,
     };
 
-    // The plugin emits `generation_created` for every turn; LiveKit ignores the
-    // ones it already knows about because it created the speech handle itself.
     this.emit('generation_created', event);
     return event;
   }
 }
 
 /** Stand-in for the plugin's `RealtimeModel`. */
-export class FakePhonicRealtimeModel extends llm.RealtimeModel {
-  activeSession?: FakePhonicRealtimeSession;
+export class FakeDeepslateRealtimeModel extends llm.RealtimeModel {
+  activeSession?: FakeDeepslateRealtimeSession;
 
   constructor() {
     super({
-      // Copied from @livekit/agents-plugin-phonic@1.9.3 `RealtimeModel`:
-      messageTruncation: false,
+      // Copied from @deepslate-labs/livekit@0.1.23 `RealtimeModel`.
+      messageTruncation: true,
       turnDetection: true,
       userTranscription: true,
       autoToolReplyGeneration: true,
       manualFunctionCalls: false,
       audioOutput: true,
-      midSessionChatCtxUpdate: true,
-      midSessionInstructionsUpdate: true,
-      midSessionToolsUpdate: true,
       perResponseToolChoice: false,
     });
   }
 
   override get model(): string {
-    return 'fake-phonic';
+    return 'fake-deepslate';
   }
 
-  override session(): FakePhonicRealtimeSession {
-    const session = new FakePhonicRealtimeSession(this);
+  override get provider(): string {
+    return 'deepslate';
+  }
+
+  override session(): FakeDeepslateRealtimeSession {
+    const session = new FakeDeepslateRealtimeSession(this);
     this.activeSession = session;
     return session;
   }
@@ -337,7 +344,7 @@ export class RecordingAudioOutput extends voice.AudioOutput {
   flushes = 0;
 
   constructor() {
-    super(PHONIC_SAMPLE_RATE, undefined, { pause: true });
+    super(DEEPSLATE_SAMPLE_RATE, undefined, { pause: true });
   }
 
   override async captureFrame(frame: AudioFrame): Promise<void> {

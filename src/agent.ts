@@ -1,7 +1,7 @@
 /**
  * The conversational agent definition (prompt only — no tools, no database).
  *
- * Phonic handles speech-to-speech generation; this file only supplies the
+ * Deepslate Opal handles speech generation; this file only supplies the
  * instructions that shape how the agent talks.
  */
 import { voice } from '@livekit/agents';

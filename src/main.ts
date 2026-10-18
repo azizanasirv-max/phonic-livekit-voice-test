@@ -2,7 +2,7 @@
  * Agent entry point.
  *
  * Starts a LiveKit agent server that, for every dispatched room job, opens a
- * speech-to-speech session with Phonic via @livekit/agents-plugin-phonic.
+ * realtime session with Deepslate Opal via @deepslate-labs/livekit.
  *
  * Usage:
  *   node src/main.ts dev      # development worker (also works with `lk agent dev`)
@@ -12,10 +12,14 @@ import { type JobContext, ServerOptions, cli, defineAgent, voice } from '@liveki
 import dotenv from 'dotenv';
 import { fileURLToPath } from 'node:url';
 import { createAgent } from './agent.ts';
-import { assertRequiredEnv, readEnv, safeEnvSummary } from './config.ts';
+import { readEnv, safeEnvSummary } from './config.ts';
+import {
+  createRealtimeModel,
+  describeVoiceOutput,
+  resolveDeepslateConfig,
+} from './deepslate.ts';
 import { GREETING_INSTRUCTIONS } from './instructions.ts';
-import { describeError, logError, logInfo, logWarn } from './logging.ts';
-import { createRealtimeModel, resolvePhonicOptions } from './phonic.ts';
+import { describeError, logError, logInfo } from './logging.ts';
 import { createAgentSession, describeTurnHandling } from './session.ts';
 
 // Load .env before anything reads process.env (ServerOptions resolves
@@ -27,35 +31,30 @@ dotenv.config({ path: fileURLToPath(new URL('../.env', import.meta.url)), quiet:
 
 export default defineAgent({
   entry: async (ctx: JobContext) => {
-    // Phonic is the only credential this code reads directly. LiveKit's own
-    // variables (LIVEKIT_URL / LIVEKIT_API_KEY / LIVEKIT_API_SECRET) are
-    // validated by the agent server with clear errors when it starts.
-    assertRequiredEnv(process.env, ['PHONIC_API_KEY']);
-
-    const phonicOptions = resolvePhonicOptions();
+    // Deepslate credentials and the server-side TTS config are validated here,
+    // before a session is opened, so a missing value fails one job with a clear
+    // message instead of surfacing as a dropped connection. LiveKit's own
+    // variables are validated by the agent server with clear errors when it
+    // starts.
+    const config = resolveDeepslateConfig();
+    const voiceOutput = describeVoiceOutput(config.ttsConfig);
 
     logInfo('job accepted', {
       room: ctx.room.name,
-      voice: phonicOptions.voice,
+      provider: 'deepslate',
+      model: config.model ?? '(platform default)',
+      voiceProvider: voiceOutput.provider,
+      voiceId: voiceOutput.voiceId,
     });
 
     // The turn-handling policy is fixed (see src/session.ts). Log it once per
     // job so a run can be matched against the settings it was recorded with.
     logInfo('turn handling policy', { policy: describeTurnHandling() });
 
-    if (phonicOptions.minWordsToInterrupt > 1) {
-      logWarn('Phonic will not stop the assistant until the user has spoken this many words', {
-        minWordsToInterrupt: phonicOptions.minWordsToInterrupt,
-        effect: "the assistant keeps speaking over the start of the user's interruption",
-      });
-    }
-
     const session = createAgentSession(
-      // Phonic replaces the STT/LLM/TTS pipeline with a single
-      // speech-to-speech model. It reads PHONIC_API_KEY from the environment.
-      createRealtimeModel(process.env, (conversationId) => {
-        logInfo('phonic conversation created', { conversationId });
-      }),
+      // Opal replaces the STT/LLM/TTS pipeline with one realtime model. Audio
+      // output is produced by Deepslate's server-side TTS configured above.
+      createRealtimeModel(process.env),
     );
 
     // Surface session-level problems (connection drops, provider errors) with
@@ -67,8 +66,9 @@ export default defineAgent({
     // Interruption lifecycle, observed through public session events only. These
     // lines are what you correlate against a recording to measure how long the
     // assistant kept talking after the user started: `user_state listening`
-    // (Phonic heard speech) should be immediately followed by `agent_state`
-    // leaving `speaking`, and by `speech created` for the next turn.
+    // (Deepslate's VAD heard speech) should be immediately followed by
+    // `agent_state` leaving `speaking`, and by `speech created` for the next
+    // turn.
     session.on(voice.AgentSessionEventTypes.SpeechCreated, (event) => {
       logInfo('speech created', {
         speechId: event.speechHandle.id,
@@ -85,14 +85,15 @@ export default defineAgent({
       logInfo('user state', { oldState: event.oldState, newState: event.newState });
     });
 
+    // Join the room first (as in Deepslate's official LiveKit example), then
+    // start the session so Opal's first turn has somewhere to play.
+    await ctx.connect();
+    logInfo('agent connected to room', { room: ctx.room.name });
+
     await session.start({
       agent: createAgent(),
       room: ctx.room,
     });
-
-    // Join the room, then speak first.
-    await ctx.connect();
-    logInfo('agent connected to room', { room: ctx.room.name });
 
     await session.generateReply({ instructions: GREETING_INSTRUCTIONS });
   },
@@ -101,7 +102,15 @@ export default defineAgent({
 // Run the agent server. The `agent` option points at this file so job
 // subprocesses can import the default export above.
 try {
-  logInfo('starting agent server', safeEnvSummary());
+  // Fail fast on missing Deepslate credentials or voice output, before the
+  // server starts retrying a connection. Messages never include values.
+  const startupConfig = resolveDeepslateConfig();
+  const startupVoice = describeVoiceOutput(startupConfig.ttsConfig);
+  logInfo('starting agent server', {
+    ...safeEnvSummary(),
+    voiceProvider: startupVoice.provider,
+    voiceId: startupVoice.voiceId,
+  });
   cli.runApp(
     new ServerOptions({
       agent: fileURLToPath(import.meta.url),
@@ -113,8 +122,9 @@ try {
     }),
   );
 } catch (error) {
-  // Most likely cause: bad credentials or an unreachable LIVEKIT_URL.
+  // Most likely cause: missing/invalid Deepslate credentials or voice output,
+  // or an unreachable LIVEKIT_URL.
   logError('agent server failed to start', error);
-  logWarn(`detail: ${describeError(error)}`);
+  logInfo('startup failure detail', { detail: describeError(error) });
   process.exitCode = 1;
 }

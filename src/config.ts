@@ -1,14 +1,22 @@
 /**
- * Environment-variable handling for the Phonic + LiveKit voice prototype.
+ * Environment-variable handling for the Deepslate Opal + LiveKit voice
+ * prototype.
  *
  * All `process.env` access goes through this module so that:
  *  - required variables are validated in one place with friendly messages, and
  *  - credentials can be redacted before anything is written to a log.
  */
 
-/** Variables the agent needs before it can start a voice session. */
+/**
+ * Variables the agent needs before it can start a voice session.
+ *
+ * Voice output (Deepslate hosted TTS or ElevenLabs) is validated separately in
+ * `src/deepslate.ts`, because either provider can supply it.
+ */
 export const REQUIRED_ENV_VARS = [
-  'PHONIC_API_KEY',
+  'DEEPSLATE_VENDOR_ID',
+  'DEEPSLATE_ORGANIZATION_ID',
+  'DEEPSLATE_API_KEY',
   'LIVEKIT_URL',
   'LIVEKIT_API_KEY',
   'LIVEKIT_API_SECRET',
@@ -18,7 +26,8 @@ export type RequiredEnvVar = (typeof REQUIRED_ENV_VARS)[number];
 
 /** Variables whose values are secrets and must never be logged verbatim. */
 export const SECRET_ENV_VARS = [
-  'PHONIC_API_KEY',
+  'DEEPSLATE_API_KEY',
+  'ELEVENLABS_API_KEY',
   'LIVEKIT_API_KEY',
   'LIVEKIT_API_SECRET',
 ] as const;
@@ -80,14 +89,17 @@ export function maskSecret(value?: string): string {
 /** Masked view of the environment, safe to log at startup. */
 export function safeEnvSummary(env: EnvLike = process.env): Record<string, string> {
   return {
-    PHONIC_API_KEY: maskSecret(readEnv('PHONIC_API_KEY', env)),
+    DEEPSLATE_VENDOR_ID: readEnv('DEEPSLATE_VENDOR_ID', env) ?? '(not set)',
+    DEEPSLATE_ORGANIZATION_ID: readEnv('DEEPSLATE_ORGANIZATION_ID', env) ?? '(not set)',
+    DEEPSLATE_API_KEY: maskSecret(readEnv('DEEPSLATE_API_KEY', env)),
+    DEEPSLATE_MODEL: readEnv('DEEPSLATE_MODEL', env) ?? '(platform default)',
+    DEEPSLATE_TTS_PROVIDER: readEnv('DEEPSLATE_TTS_PROVIDER', env) ?? '(auto)',
+    DEEPSLATE_VOICE_ID: readEnv('DEEPSLATE_VOICE_ID', env) ?? '(not set)',
+    ELEVENLABS_API_KEY: maskSecret(readEnv('ELEVENLABS_API_KEY', env)),
+    ELEVENLABS_VOICE_ID: readEnv('ELEVENLABS_VOICE_ID', env) ?? '(not set)',
     LIVEKIT_URL: readEnv('LIVEKIT_URL', env) ?? '(not set)',
     LIVEKIT_API_KEY: maskSecret(readEnv('LIVEKIT_API_KEY', env)),
     LIVEKIT_API_SECRET: maskSecret(readEnv('LIVEKIT_API_SECRET', env)),
-    PHONIC_VOICE: readEnv('PHONIC_VOICE', env) ?? '(not set)',
-    PHONIC_MIN_WORDS_TO_INTERRUPT: readEnv('PHONIC_MIN_WORDS_TO_INTERRUPT', env) ?? '(not set)',
-    PHONIC_VAD_MIN_SPEECH_MS: readEnv('PHONIC_VAD_MIN_SPEECH_MS', env) ?? '(not set)',
-    PHONIC_VAD_MIN_SILENCE_MS: readEnv('PHONIC_VAD_MIN_SILENCE_MS', env) ?? '(not set)',
     LIVEKIT_AGENT_NAME: readEnv('LIVEKIT_AGENT_NAME', env) ?? '(not set)',
   };
 }
@@ -135,6 +147,22 @@ export function readOptionalIntEnv(name: string, env: EnvLike = process.env): nu
   if (raw === undefined) return undefined;
   const parsed = Number.parseInt(raw, 10);
   return Number.isInteger(parsed) && parsed >= 0 ? parsed : undefined;
+}
+
+/**
+ * Parse an optional float env override (for VAD thresholds).
+ *
+ * Like {@link readOptionalIntEnv}, an unparseable or negative value is treated
+ * as unset so a typo cannot change VAD behaviour.
+ */
+export function readOptionalFloatEnv(
+  name: string,
+  env: EnvLike = process.env,
+): number | undefined {
+  const raw = readEnv(name, env);
+  if (raw === undefined) return undefined;
+  const parsed = Number.parseFloat(raw);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : undefined;
 }
 
 /** Hostnames that mean "a LiveKit server running locally". */

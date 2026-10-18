@@ -10,10 +10,10 @@ import { describe, it } from 'node:test';
 import { TURN_HANDLING_POLICY, describeTurnHandling, resolveTurnHandling } from '../src/session.ts';
 
 describe('resolveTurnHandling', () => {
-  it('keeps Phonic in charge of turn detection', () => {
-    // `realtime_llm` means "the realtime model detects turns", i.e. Phonic's
+  it('keeps Deepslate in charge of turn detection', () => {
+    // `realtime_llm` means "the realtime model detects turns", i.e. Deepslate's
     // server-side detection. It must never be replaced by a client-side VAD or
-    // turn detector, which would fight Phonic's interruption events.
+    // turn detector, which would fight Deepslate's interruption events.
     assert.equal(resolveTurnHandling().turnDetection, 'realtime_llm');
   });
 
@@ -26,7 +26,7 @@ describe('resolveTurnHandling', () => {
     // user. That is exactly what this agent must not do.
     assert.equal(interruption.resumeFalseInterruption, false);
     assert.equal(interruption.discardAudioIfUninterruptible, true);
-    // Phonic already gates interruptions with `minWordsToInterrupt`; a second
+    // Deepslate's server-side VAD already decides when speech starts; a second
     // client-side threshold would only delay the stop.
     assert.equal(interruption.minWords, 0);
     assert.equal(interruption.minDuration, 0);

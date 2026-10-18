@@ -16,6 +16,7 @@ import {
   safeEnvSummary,
   validateLivekitUrl,
 } from './config.ts';
+import { describeVoiceOutput, resolveDeepslateConfig } from './deepslate.ts';
 
 // Resolve .env next to the project root, not relative to the current working
 // directory, so the check works no matter where it is invoked from.
@@ -27,6 +28,14 @@ try {
   for (const [key, value] of Object.entries(safeEnvSummary())) {
     console.log(`  ${key} = ${value}`);
   }
+
+  // Validates Deepslate credentials plus the server-side TTS config that makes
+  // Opal's replies audible. No network calls.
+  const config = resolveDeepslateConfig();
+  console.log(
+    `Voice output: provider=${describeVoiceOutput(config.ttsConfig).provider} ` +
+      `voice=${describeVoiceOutput(config.ttsConfig).voiceId}`,
+  );
 
   const urlCheck = validateLivekitUrl(readEnv('LIVEKIT_URL'));
   console.log('');

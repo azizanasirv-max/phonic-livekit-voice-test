@@ -1,21 +1,26 @@
 /**
- * Interruption-lifecycle regression tests for the Phonic ↔ LiveKit integration.
+ * Interruption-lifecycle regression tests for the Deepslate Opal ↔ LiveKit
+ * integration.
  *
  * These run the **real** `AgentSession`, realtime-generation and audio-playback
- * machinery from the installed `@livekit/agents`, with only Phonic replaced by
- * `FakePhonicRealtimeModel` (see `fake-phonic-realtime.ts`). No network calls,
- * no Phonic credentials, no audio devices.
+ * machinery from the installed `@livekit/agents`, with only Deepslate replaced
+ * by `FakeDeepslateRealtimeModel` (see `fake-deepslate-realtime.ts`). No network
+ * calls, no Deepslate credentials, no audio devices.
  *
  * What each test pins down:
  *
- * 1. a short (one-word) user utterance stops the assistant;
- * 2. an interruption during an in-flight generation cancels the generation and
- *    releases the audio stream;
- * 3. audio from a cancelled response is never scheduled after the cancellation;
+ * 1. a short user utterance stops the assistant;
+ * 2. an interruption during an in-flight response cancels it and releases the
+ *    audio stream, so buffered frames are never scheduled;
+ * 3. late audio from the interrupted response is *not* filtered by the plugin
+ *    (it reopens a generation) — an honest limit that depends on Deepslate
+ *    stopping the stream server-side;
  * 4. a new response starts normally after the interruption;
- * 5. repeated interruptions leave no duplicated or overlapping responses;
- * 6. the session recovers after Phonic disconnects and after a clean close;
- * 7. the turn-handling policy keeps Phonic's server-side turn detection and
+ * 5. repeated interruptions leave no overlapping responses;
+ * 6. an uninterruptable direct-speech utterance keeps playing;
+ * 7. a non-recoverable provider error closes the session and a fresh session
+ *    works;
+ * 8. the turn-handling policy keeps Deepslate's server-side turn detection and
  *    never resumes an interrupted response.
  */
 import assert from 'node:assert/strict';
@@ -24,8 +29,8 @@ import { initializeLogger, voice } from '@livekit/agents';
 
 import { createAgent } from '../src/agent.ts';
 import { createAgentSession, resolveTurnHandling } from '../src/session.ts';
-import { FakePhonicRealtimeModel, RecordingAudioOutput } from './fake-phonic-realtime.ts';
-import type { FakePhonicRealtimeSession } from './fake-phonic-realtime.ts';
+import { FakeDeepslateRealtimeModel, RecordingAudioOutput } from './fake-deepslate-realtime.ts';
+import type { FakeDeepslateRealtimeSession } from './fake-deepslate-realtime.ts';
 
 // The SDK requires its logger to be initialized before a session is created.
 initializeLogger({ pretty: false, level: 'silent' });
@@ -40,8 +45,8 @@ async function settle(ticks = 10): Promise<void> {
 }
 
 type Harness = {
-  model: FakePhonicRealtimeModel;
-  rt: FakePhonicRealtimeSession;
+  model: FakeDeepslateRealtimeModel;
+  rt: FakeDeepslateRealtimeSession;
   session: voice.AgentSession;
   output: RecordingAudioOutput;
   speeches: voice.SpeechHandle[];
@@ -49,9 +54,9 @@ type Harness = {
   errors: unknown[];
 };
 
-/** Start a session over the fake Phonic model, wired exactly like production. */
+/** Start a session over the fake Deepslate model, wired like production. */
 async function startHarness(): Promise<Harness> {
-  const model = new FakePhonicRealtimeModel();
+  const model = new FakeDeepslateRealtimeModel();
   const session = createAgentSession(model);
   const output = new RecordingAudioOutput();
   session.output.audio = output;
@@ -63,7 +68,7 @@ async function startHarness(): Promise<Harness> {
     speeches: [] as voice.SpeechHandle[],
     agentStates: [] as voice.AgentState[],
     errors: [] as unknown[],
-    rt: undefined as unknown as FakePhonicRealtimeSession,
+    rt: undefined as unknown as FakeDeepslateRealtimeSession,
   };
 
   session.on(voice.AgentSessionEventTypes.SpeechCreated, (event) => {
@@ -82,7 +87,7 @@ async function startHarness(): Promise<Harness> {
 }
 
 describe('interruption lifecycle', () => {
-  it('stops the assistant when Phonic reports a short (one-word) utterance', async () => {
+  it('stops the assistant when Deepslate reports user speech', async () => {
     const h = await startHarness();
 
     const speech = h.session.generateReply();
@@ -91,15 +96,14 @@ describe('interruption lifecycle', () => {
     await settle();
     assert.ok(h.output.framesCaptured > 0, 'the response should be playing');
 
-    // Phonic's server-side VAD hears one word and reports `user_started_speaking`.
-    // With `minWordsToInterrupt: 1` that is already an interruption.
+    // Deepslate's server-side VAD reports the caller speaking.
     h.rt.userStartedSpeaking();
     await settle();
 
     assert.equal(speech.interrupted, true, 'the active response must be interrupted');
     assert.equal(h.rt.turnsInterrupted, 1);
     assert.ok(h.output.clears >= 1, 'queued audio must be dropped from the playback path');
-    assert.equal(h.rt.turnOpen, false, 'no Phonic turn may be left open');
+    assert.equal(h.rt.turnOpen, false, 'no Deepslate response may be left open');
 
     await h.session.close();
   });
@@ -112,7 +116,6 @@ describe('interruption lifecycle', () => {
     h.rt.pushAssistantAudio('A long reply that is still');
     await settle();
 
-    // The generation is still open: Phonic has not finished speaking.
     assert.equal(h.rt.turnOpen, true);
     const framesBefore = h.output.framesCaptured;
 
@@ -131,7 +134,7 @@ describe('interruption lifecycle', () => {
     await h.session.close();
   });
 
-  it('never schedules audio from a cancelled response after the interruption', async () => {
+  it('never schedules buffered frames after the interruption', async () => {
     const h = await startHarness();
 
     const speech = h.session.generateReply();
@@ -141,15 +144,12 @@ describe('interruption lifecycle', () => {
     const framesBefore = h.output.framesCaptured;
     assert.equal(framesBefore, 1);
 
-    // Phonic streams ahead of real time, so at the moment the interruption lands
-    // several more chunks of the *same* response are already buffered in the
-    // generation's audio stream. This models the worst case — the provider
-    // reports user speech but keeps its generation open — so those frames stay
-    // readable and LiveKit has to stop them itself.
+    // Audio chunks Deepslate already generated are buffered in the response's
+    // audio stream when the interruption lands.
     for (let i = 0; i < 5; i += 1) {
       assert.equal(h.rt.pushAssistantAudio(`stale-${i}`), true);
     }
-    h.rt.userStartedSpeakingKeepingTurnOpen();
+    h.rt.userStartedSpeaking();
     await settle();
 
     assert.equal(speech.interrupted, true);
@@ -162,41 +162,38 @@ describe('interruption lifecycle', () => {
     assert.equal(
       h.rt.audioStreamCancelled,
       true,
-      'LiveKit must cancel the generation audio stream, not drain it',
+      'LiveKit must cancel the response audio stream, not drain it',
     );
-
-    // Even after that, nothing more from this response may be scheduled: the
-    // generation's stream was cancelled, so the provider cannot write to it.
-    assert.equal(h.rt.pushAssistantAudio('still stale'), false);
-    await settle();
-    assert.equal(h.output.framesCaptured, framesBefore);
 
     await h.session.close();
   });
 
-  it('drops chunks that arrive after the interrupted generation is closed', async () => {
+  it('documents the plugin limit: late server audio reopens a response', async () => {
     const h = await startHarness();
 
     const speech = h.session.generateReply();
     await settle();
     h.rt.pushAssistantAudio('first');
     await settle();
-    const framesBefore = h.output.framesCaptured;
-
-    // The plugin's normal path: `user_started_speaking` emits
-    // `input_speech_started` and then closes the generation.
     h.rt.userStartedSpeaking();
     await settle();
     assert.equal(speech.interrupted, true);
-    assert.equal(h.rt.turnOpen, false);
+    assert.equal(h.rt.turnsOpened, 1);
 
-    // A chunk that arrives after the close is dropped by the plugin, and it must
-    // not resurrect the response as a new generation.
-    assert.equal(h.rt.pushAssistantAudio('late'), false);
+    // @deepslate-labs/livekit@0.1.23 does not drop audioChunks that arrive after
+    // a playbackBufferClear: audioChunk calls ensureGeneration(), which opens a
+    // new response. Preventing this depends on Deepslate stopping generation
+    // server-side, not on LiveKit or this agent. The test records the behaviour
+    // so the limitation is visible rather than assumed away.
+    const framesAfterInterrupt = h.output.framesCaptured;
+    assert.equal(h.rt.pushAssistantAudio('late chunk from the same response'), true);
     await settle();
-    assert.equal(h.output.framesCaptured, framesBefore);
-    assert.equal(h.rt.turnsOpened, 1, 'a late chunk must not open a new response');
-    assert.ok(h.rt.framesDropped >= 1);
+
+    assert.equal(h.rt.turnsOpened, 2, 'the plugin opens a new response for late audio');
+    assert.ok(
+      h.output.framesCaptured > framesAfterInterrupt,
+      'late audio is scheduled by LiveKit — it cannot be recalled locally',
+    );
 
     await h.session.close();
   });
@@ -213,9 +210,9 @@ describe('interruption lifecycle', () => {
     assert.equal(first.interrupted, true);
     const framesAfterInterrupt = h.output.framesCaptured;
 
-    // The user finishes their turn and Phonic starts the next response.
+    // The user finishes their turn and Deepslate starts the next response.
     h.rt.userFinishedSpeaking();
-    const nextTurn = h.rt.assistantTurnFromPhonic();
+    const nextTurn = h.rt.assistantTurnFromServer();
     assert.equal(nextTurn.userInitiated, false);
     await settle();
     assert.equal(h.rt.pushAssistantAudio('the second reply'), true);
@@ -234,7 +231,7 @@ describe('interruption lifecycle', () => {
     await h.session.close();
   });
 
-  it('survives repeated interruptions without duplicated or overlapping responses', async () => {
+  it('survives repeated interruptions without overlapping responses', async () => {
     const h = await startHarness();
     let expectedFrames = 0;
 
@@ -256,7 +253,6 @@ describe('interruption lifecycle', () => {
         `round ${round}: exactly one response may be live`,
       );
 
-      // A burst of the response is still buffered when the user cuts in.
       for (let i = 0; i < 4; i += 1) {
         assert.equal(h.rt.pushAssistantAudio(`round ${round} stale ${i}`), true);
       }
@@ -284,36 +280,44 @@ describe('interruption lifecycle', () => {
     await h.session.close();
   });
 
-  it('recovers after Phonic disconnects mid-response', async () => {
+  it('lets an uninterruptable direct-speech utterance finish', async () => {
     const h = await startHarness();
 
-    const speech = h.session.generateReply();
+    // Mirrors speakDirect(text, includeInHistory, uninterruptable=true).
+    await h.rt.speakDirectUninterruptable('This notice must play to the end.');
     await settle();
-    h.rt.pushAssistantAudio('a reply that will be cut off by a disconnect');
+    const framesBefore = h.output.framesCaptured;
+    assert.ok(framesBefore > 0);
+
+    h.rt.userStartedSpeaking();
+    await settle();
+
+    assert.equal(h.rt.turnOpen, true, 'the notice must keep playing');
+    assert.equal(h.output.clears, 0, 'nothing may be flushed while it is uninterruptable');
+    assert.equal(h.output.framesCaptured, framesBefore);
+
+    await h.session.close();
+  });
+
+  it('closes the session on an unrecoverable provider error and recovers fresh', async () => {
+    const h = await startHarness();
+
+    h.session.generateReply();
+    await settle();
+    h.rt.pushAssistantAudio('a reply that will be cut off');
     await settle();
     const framesBeforeDrop = h.output.framesCaptured;
 
-    // Mirrors the plugin's socket `close` handler: drop the open generation and
-    // report the abnormal close.
-    h.rt.simulateSocketClose(1006);
-    await settle();
+    // The plugin emits provider errors with recoverable: false.
+    h.rt.simulateProviderError('Deepslate WS closed unexpectedly');
+    await settle(20);
 
-    assert.equal(h.rt.turnOpen, false, 'the in-flight generation must be dropped');
-    assert.equal(speech.interrupted, true);
-    assert.ok(h.errors.length >= 1, 'the disconnect must be surfaced to the session');
-
-    // The plugin reports an abnormal socket close as *unrecoverable*, so LiveKit
-    // tears the session down instead of carrying on over a dead socket.
+    assert.equal(h.errors.length, 1, 'the provider error must be surfaced');
     assert.throws(() => h.session.generateReply(), /not running/);
 
-    // Whatever the provider still had buffered must not be scheduled.
-    assert.equal(h.rt.pushAssistantAudio('audio from the dead socket'), false);
+    // Whatever the provider had buffered must not be scheduled by this session.
     await settle();
-    assert.equal(
-      h.output.framesCaptured,
-      framesBeforeDrop,
-      'nothing from the dropped connection may be scheduled',
-    );
+    assert.equal(h.output.framesCaptured, framesBeforeDrop);
 
     // The next job starts a fresh session on the same code path and speaks.
     const fresh = await startHarness();
@@ -343,9 +347,8 @@ describe('interruption lifecycle', () => {
     await settle();
 
     assert.equal(h.rt.closed, true, 'the model session must be closed');
-    assert.equal(h.rt.turnOpen, false, 'no generation may survive the close');
+    assert.equal(h.rt.turnOpen, false, 'no response may survive the close');
 
-    assert.equal(h.rt.pushAssistantAudio('after close'), false);
     await settle();
     assert.equal(h.output.framesCaptured, framesBeforeClose);
 
@@ -363,21 +366,20 @@ describe('interruption lifecycle', () => {
     await fresh.session.close();
   });
 
-  it('pins Phonic server-side turn detection and never resumes an interrupted response', () => {
-    const model = new FakePhonicRealtimeModel();
+  it('pins Deepslate server-side turn detection and never resumes an interrupted response', () => {
+    const model = new FakeDeepslateRealtimeModel();
     const session = createAgentSession(model);
     const { turnDetection, interruption } = session.sessionOptions.turnHandling;
 
-    // Phonic's own turn detection stays in charge.
+    // Deepslate's own VAD stays in charge of turns.
     assert.equal(turnDetection, 'realtime_llm');
     assert.equal(model.capabilities.turnDetection, true);
-    assert.notEqual(model.capabilities.supportsOverlappingSpeech, true);
 
     // Interruptions are on, and an interrupted response is never resumed.
     assert.equal(interruption.enabled, true);
     assert.equal(interruption.resumeFalseInterruption, false);
     assert.equal(interruption.discardAudioIfUninterruptible, true);
-    // No second client-side threshold on top of Phonic's `minWordsToInterrupt`.
+    // No second client-side threshold on top of Deepslate's server-side VAD.
     assert.equal(interruption.minWords, 0);
     assert.equal(interruption.minDuration, 0);
 
