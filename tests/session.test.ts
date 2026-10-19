@@ -7,7 +7,14 @@
  */
 import assert from 'node:assert/strict';
 import { describe, it } from 'node:test';
-import { TURN_HANDLING_POLICY, describeTurnHandling, resolveTurnHandling } from '../src/session.ts';
+import {
+  AUDIO_OUTPUT_QUEUE_MS,
+  TURN_HANDLING_POLICY,
+  describeTurnHandling,
+  resolveRoomInputOptions,
+  resolveRoomOutputOptions,
+  resolveTurnHandling,
+} from '../src/session.ts';
 
 describe('resolveTurnHandling', () => {
   it('keeps the realtime model in charge of turn detection', () => {
@@ -51,3 +58,23 @@ describe('describeTurnHandling', () => {
     assert.match(summary, /minWords=0/);
   });
 });
+
+describe('audio output tuning', () => {
+  it('uses the SDK-supported output queue instead of inventing jitter settings', () => {
+    // `RoomOutputOptions.queueSizeMs` is the only agent-side audio buffer the
+    // installed @livekit/agents exposes; @livekit/rtc-node has no jitter buffer
+    // option, so none is configured.
+    assert.equal(AUDIO_OUTPUT_QUEUE_MS, 400);
+    assert.deepEqual(resolveRoomOutputOptions(), { queueSizeMs: 400 });
+  });
+
+  it('pins participant-disconnect handling explicitly', () => {
+    assert.deepEqual(resolveRoomInputOptions(), { closeOnDisconnect: true });
+  });
+
+  it('returns fresh option objects so callers cannot mutate shared state', () => {
+    assert.notEqual(resolveRoomOutputOptions(), resolveRoomOutputOptions());
+    assert.notEqual(resolveRoomInputOptions(), resolveRoomInputOptions());
+  });
+});
+

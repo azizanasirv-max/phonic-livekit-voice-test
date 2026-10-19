@@ -141,9 +141,10 @@ export function resolveTtsConfig(env: EnvLike = process.env): TtsConfig {
       : '';
 
   throw new ConfigError(
-    'No audio output configured for Opal. Set DEEPSLATE_HOSTED_VOICE_ID to a voice ' +
-      'cloned in the Deepslate platform, or set both ELEVENLABS_API_KEY and ' +
-      `ELEVENLABS_VOICE_ID.${partial}`,
+    'No audio output configured for Opal. Set both ELEVENLABS_API_KEY and ' +
+      'ELEVENLABS_VOICE_ID (this deployment uses server-side ElevenLabs TTS), ' +
+      'or set DEEPSLATE_HOSTED_VOICE_ID if you have a Deepslate-hosted voice.' +
+      partial,
   );
 }
 

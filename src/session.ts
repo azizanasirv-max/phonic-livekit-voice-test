@@ -99,6 +99,35 @@ export function createAgentSession(llm: llm.RealtimeModel): voice.AgentSession {
   });
 }
 
+/**
+ * Output queue used by LiveKit's `AudioSource` for agent audio.
+ *
+ * `RoomOutputOptions.queueSizeMs` is the only buffering knob the installed
+ * SDK exposes on the agent's audio output. The default is 200 ms; 400 ms gives
+ * the server-side ElevenLabs TTS a little headroom so a burst of frames is not
+ * discarded by the ring buffer, at a small latency cost.
+ *
+ * Jitter buffering is *not* configurable here: `@livekit/rtc-node`'s
+ * `RoomOptions` has no jitter-buffer field, so none is invented.
+ */
+export const AUDIO_OUTPUT_QUEUE_MS = 400;
+
+/**
+ * Room input options for every session.
+ *
+ * `closeOnDisconnect: true` is the SDK default, pinned explicitly: when the
+ * linked participant leaves for a client-initiated reason, the session closes
+ * instead of lingering in an empty room.
+ */
+export function resolveRoomInputOptions(): { closeOnDisconnect: boolean } {
+  return { closeOnDisconnect: true };
+}
+
+/** Room output options; see {@link AUDIO_OUTPUT_QUEUE_MS}. */
+export function resolveRoomOutputOptions(): { queueSizeMs: number } {
+  return { queueSizeMs: AUDIO_OUTPUT_QUEUE_MS };
+}
+
 /** One-line, non-secret summary of the policy, for startup logs. */
 export function describeTurnHandling(): string {
   const { turnDetection, interruption } = TURN_HANDLING_POLICY;

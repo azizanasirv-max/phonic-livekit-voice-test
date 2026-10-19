@@ -1,75 +1,107 @@
-# Deploy a new version of the EXISTING Deepslate Opal LiveKit Cloud agent.
+# Create or deploy the Deepslate Opal LiveKit Cloud agent.
 #
-# Identity comes from the committed livekit.toml:
-#   [project] subdomain = "<existing project>"
-#   [agent]   id        = "CA_<existing agent>"
+# The previous agent was DELETED. The first run must therefore be
+# `operation: create` with `confirm_create: true`. Create registers a new agent,
+# deploys it, and writes the new `livekit.toml`. The workflow then uploads that
+# file as an artifact and commits it back to this branch, so every later run can
+# use `operation: deploy` and update the SAME agent instead of creating another.
 #
-# This workflow never runs the LiveKit "create" operation. It only ships a new
-# version of that agent and then checks its status, so it cannot register a
-# second production agent by accident.
+# There is NO automatic fallback between create and deploy:
+#   * deploy fails if `livekit.toml` is missing or has no CA_... agent id;
+#   * create fails if `livekit.toml` already exists or confirm_create is false.
+#     (The official action would otherwise exit successfully without creating
+#     anything when the file exists, or create a duplicate after a lost file.)
 #
-# MANUAL ONLY: there is no push/pull_request trigger. Nothing reaches LiveKit
-# Cloud unless a human starts a run from the Actions tab.
+# MANUAL ONLY: workflow_dispatch has no push/PR trigger. Nothing reaches
+# LiveKit Cloud unless a human starts a run from the Actions tab.
+#
+# TTS: this deployment uses ElevenLabs server-side TTS. Deepslate does not
+# provide a hosted voice id, and the plugin's only TTS backends are
+# `eleven_labs` and Deepslate-hosted (`hosted`). ELEVENLABS_API_KEY and
+# ELEVENLABS_VOICE_ID are therefore required. DEEPSLATE_HOSTED_VOICE_ID is
+# still accepted if it is ever added, but it is NOT required.
 #
 # Repository secrets (Settings -> Secrets and variables -> Actions):
-#   LIVEKIT_URL                existing LiveKit deployment credential
-#   LIVEKIT_API_KEY            existing LiveKit deployment credential
-#   LIVEKIT_API_SECRET         existing LiveKit deployment credential
-#   DEEPSLATE_VENDOR_ID        Deepslate vendor id
-#   DEEPSLATE_ORGANIZATION_ID  Deepslate organization id
-#   DEEPSLATE_API_KEY          Deepslate API key (secret)
-#   DEEPSLATE_HOSTED_VOICE_ID  OR ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID
+#   Required:
+#     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
+#     DEEPSLATE_VENDOR_ID, DEEPSLATE_ORGANIZATION_ID, DEEPSLATE_API_KEY
+#     ELEVENLABS_API_KEY, ELEVENLABS_VOICE_ID
+#   Optional:
+#     DEEPSLATE_MODEL, DEEPSLATE_VAD_START_MS, DEEPSLATE_VAD_STOP_MS,
+#     DEEPSLATE_VAD_CONFIDENCE, DEEPSLATE_VAD_MIN_VOLUME,
+#     DEEPSLATE_VAD_BACKBUFFER_MS, ELEVENLABS_MODEL_ID, LIVEKIT_AGENT_NAME,
+#     DEEPSLATE_HOSTED_VOICE_ID (alternative to the ElevenLabs pair)
+#   Legacy/optional:
+#     SECRET_LIST - not needed; if present, its KEY=VALUE pairs are migrated
+#     and obsolete PHONIC_* entries are dropped. Individual secrets win.
 #
-# Optional secrets: DEEPSLATE_MODEL, DEEPSLATE_VAD_START_MS,
-# DEEPSLATE_VAD_STOP_MS, DEEPSLATE_VAD_CONFIDENCE, DEEPSLATE_VAD_MIN_VOLUME,
-# DEEPSLATE_VAD_BACKBUFFER_MS, ELEVENLABS_MODEL_ID, LIVEKIT_AGENT_NAME.
-#
-# Backwards compatibility: if the legacy `SECRET_LIST` repository secret still
-# exists, its KEY=VALUE pairs are migrated into the new list and obsolete
-# provider entries are dropped. Individual repository secrets take precedence.
-#
-# No value is ever printed. Each value placed in the deploy-action SECRET_LIST
-# input is registered with ::add-mask:: first.
-name: Deploy LiveKit Cloud Agent
+# No secret value is printed. Every value placed in the deploy-action
+# SECRET_LIST input is registered with ::add-mask:: first.
+name: Create or Deploy LiveKit Cloud Agent
 
 on:
   workflow_dispatch:
     inputs:
+      operation:
+        description: >-
+          "create" registers a NEW LiveKit Cloud agent (first run only) and
+          writes livekit.toml. "deploy" ships a new version of the agent named
+          in the committed livekit.toml. There is no automatic fallback.
+        required: true
+        type: choice
+        options:
+          - deploy
+          - create
+        default: deploy
+      confirm_create:
+        description: >-
+          Safety confirmation for operation=create. Must be true, and
+          livekit.toml must be absent, or the run stops before creating.
+        required: false
+        type: boolean
+        default: false
       region:
         description: >-
-          Optional LiveKit Cloud region (for example "us-east"). Leave empty to
-          deploy to the region the agent already uses / the nearest region.
+          Optional LiveKit Cloud region (for example "us-east"). Leave empty
+          for the region the agent already uses / the nearest region.
         required: false
         type: string
         default: ""
       room_smoke_test:
         description: >-
-          After deployment, join a temporary LiveKit room with a subscribe-only
-          participant and verify that the deployed agent joins it.
+          After the agent is healthy, join a temporary LiveKit room with a
+          subscribe-only participant and verify that the deployed agent joins.
         required: false
         type: boolean
         default: true
 
-# One fixed group, so two deployments to the same LiveKit Cloud agent can never
-# race. cancel-in-progress is deliberately false: cancelling halfway through a
-# container build or deploy could leave the agent partially updated.
+# One fixed group, so two runs against the same LiveKit Cloud agent can never
+# race. cancel-in-progress is false: cancelling mid-deploy could leave the
+# agent partially updated, and cancelling a create could leave an agent whose
+# livekit.toml was never committed.
 concurrency:
   group: livekit-cloud-agent-deploy
   cancel-in-progress: false
 
-# The workflow only reads the repository. It does not commit or push anything.
+# contents: write is used only by the create path, to commit the generated
+# livekit.toml back to the branch the workflow ran on. Deploy only reads.
 permissions:
-  contents: read
+  contents: write
 
 jobs:
-  deploy:
-    name: Verify and deploy existing agent
+  agent:
+    name: ${{ inputs.operation }} LiveKit Cloud agent
     runs-on: ubuntu-latest
     timeout-minutes: 45
 
     steps:
       - name: Checkout repository
         uses: actions/checkout@v4
+        with:
+          # Persisted credentials are used to push the generated livekit.toml.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Full history makes the rebase-before-push in the create path work.
+          fetch-depth: 0
 
       - name: Set up Node.js
         uses: actions/setup-node@v4
@@ -86,48 +118,96 @@ jobs:
       - name: Run tests
         run: npm test
 
-      # livekit.toml is the deployment identity. It is read, never rewritten.
-      # Refusing to continue here is what keeps this an upgrade of the existing
-      # agent rather than the creation of a new one.
-      - name: Preflight livekit.toml (existing agent identity)
+      # Deployment identity is explicit. Deploy never creates; create never
+      # runs when an identity already exists. This is the guard that prevents
+      # silently registering a second production agent.
+      - name: Preflight agent identity
+        env:
+          OPERATION: ${{ inputs.operation }}
+          CONFIRM_CREATE: ${{ inputs.confirm_create }}
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
         run: |
           set -euo pipefail
-          if [ ! -f livekit.toml ]; then
-            echo "::error::livekit.toml is missing. Refusing to deploy: this workflow upgrades the existing agent and never creates one."
+
+          if [ "${GITHUB_REF}" != "refs/heads/${GITHUB_REF_NAME}" ]; then
+            echo "::error::Run this workflow from a branch (not a tag), so a generated livekit.toml can be committed back."
+            exit 1
+          fi
+          if [ -z "${LIVEKIT_URL:-}" ]; then
+            echo "::error::LIVEKIT_URL is not set. Add it under Settings -> Secrets and variables -> Actions."
             exit 1
           fi
 
-          subdomain="$(sed -n 's/^[[:space:]]*subdomain[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
-          agent_id="$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
+          # wss://<project>.livekit.cloud -> <project>
+          project_subdomain="${LIVEKIT_URL#*://}"
+          project_subdomain="${project_subdomain%%.*}"
+          if [ -z "$project_subdomain" ]; then
+            echo "::error::Could not derive the LiveKit project subdomain from LIVEKIT_URL."
+            exit 1
+          fi
+          echo "PROJECT_SUBDOMAIN=$project_subdomain" >> "$GITHUB_ENV"
 
-          if [ -z "$subdomain" ]; then
-            echo "::error::livekit.toml has no [project] subdomain. Refusing to deploy."
-            exit 1
-          fi
-          if [ -z "$agent_id" ]; then
-            echo "::error::livekit.toml has no [agent] id. Refusing to deploy because a missing id could register a new agent."
-            exit 1
-          fi
-          case "$agent_id" in
-            CA_*) : ;;
+          case "$OPERATION" in
+            deploy)
+              if [ ! -f livekit.toml ]; then
+                echo "::error::livekit.toml is missing, so there is no existing agent to deploy. This repository does not fall back to create: run the workflow with operation=create and confirm_create=true ONCE, then commit the generated livekit.toml."
+                exit 1
+              fi
+
+              config_subdomain="$(sed -n 's/^[[:space:]]*subdomain[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
+              agent_id="$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
+
+              if [ -z "$config_subdomain" ]; then
+                echo "::error::livekit.toml has no [project] subdomain. Refusing to deploy."
+                exit 1
+              fi
+              if [ "$config_subdomain" != "$project_subdomain" ]; then
+                echo "::error::livekit.toml belongs to project '$config_subdomain' but LIVEKIT_URL is '$project_subdomain'. Refusing to deploy to the wrong project."
+                exit 1
+              fi
+              if [ -z "$agent_id" ]; then
+                echo "::error::livekit.toml has no [agent] id. Refusing to deploy, because a missing id could create a new agent."
+                exit 1
+              fi
+              case "$agent_id" in
+                CA_*) : ;;
+                *)
+                  echo "::error::livekit.toml agent id does not look like a LiveKit Cloud agent id (expected CA_...). Refusing to deploy."
+                  exit 1
+                  ;;
+              esac
+              if grep -qiE 'api[_-]?key|api[_-]?secret|token' livekit.toml; then
+                echo "::error::livekit.toml appears to contain credential material. Refusing to deploy."
+                exit 1
+              fi
+
+              echo "Target project subdomain: $project_subdomain"
+              echo "Target agent id: $agent_id"
+              echo "AGENT_ID=$agent_id" >> "$GITHUB_ENV"
+              ;;
+            create)
+              if [ "${CONFIRM_CREATE:-false}" != "true" ]; then
+                echo "::error::Refusing to create an agent without confirm_create=true. Set the confirmation input only when you intend to register a new agent."
+                exit 1
+              fi
+              if [ -f livekit.toml ]; then
+                echo "::error::livekit.toml already exists. Refusing to create a second agent. Use operation=deploy. Delete livekit.toml only after confirming the agent it names was actually deleted."
+                exit 1
+              fi
+
+              # The create action writes the new CA_... id after it registers.
+              echo "AGENT_ID=" >> "$GITHUB_ENV"
+              echo "Creating a NEW agent in project $project_subdomain (region: ${REGION:-nearest})."
+              ;;
             *)
-              echo "::error::livekit.toml agent id does not look like a LiveKit Cloud agent id (expected CA_...). Refusing to deploy."
+              echo "::error::Unsupported operation '$OPERATION'. Expected 'create' or 'deploy'."
               exit 1
               ;;
           esac
-          if grep -qiE 'api[_-]?key|api[_-]?secret|token' livekit.toml; then
-            echo "::error::livekit.toml appears to contain credential material. Refusing to deploy."
-            exit 1
-          fi
 
-          echo "Target project subdomain: $subdomain"
-          echo "Target agent id: $agent_id"
-          echo "PROJECT_SUBDOMAIN=$subdomain" >> "$GITHUB_ENV"
-          echo "AGENT_ID=$agent_id" >> "$GITHUB_ENV"
-
-      # Builds the deploy-action SECRET_LIST from individual repository secrets,
-      # migrating (and filtering) any legacy SECRET_LIST value. Only secret
-      # NAMES are printed; every value is masked before it is used.
+      # Build the deploy-action SECRET_LIST from individual repository secrets.
+      # Only names are printed; every value is masked before use. A legacy
+      # SECRET_LIST is migrated and obsolete PHONIC_* entries are dropped.
       - name: Resolve agent configuration
         id: secrets
         env:
@@ -178,7 +258,7 @@ jobs:
             echo "::add-mask::$value"
           }
 
-          # 1. Migrate the legacy KEY=VALUE list, if the repository still has it.
+          # 1. Migrate a legacy KEY=VALUE list, if one still exists.
           IFS=',' read -r -a pairs <<< "${LEGACY_SECRET_LIST:-}"
           for pair in "${pairs[@]}"; do
             [ -n "$pair" ] || continue
@@ -201,7 +281,7 @@ jobs:
           add_pair ELEVENLABS_MODEL_ID "${ELEVENLABS_MODEL_ID:-}"
           add_pair LIVEKIT_AGENT_NAME "${LIVEKIT_AGENT_NAME:-}"
 
-          # 3. Fail clearly, by name only, when configuration is incomplete.
+          # 3. Fail by variable NAME only when configuration is incomplete.
           missing=()
           for key in DEEPSLATE_VENDOR_ID DEEPSLATE_ORGANIZATION_ID DEEPSLATE_API_KEY; do
             if [ -z "${values[$key]:-}" ]; then
@@ -217,8 +297,11 @@ jobs:
           eleven_key="${values[ELEVENLABS_API_KEY]:-}"
           eleven_voice="${values[ELEVENLABS_VOICE_ID]:-}"
           if [ -z "$hosted" ] && { [ -z "$eleven_key" ] || [ -z "$eleven_voice" ]; }; then
-            echo "::error::No audio output configured. Set DEEPSLATE_HOSTED_VOICE_ID, or set both ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID."
+            echo "::error::No audio output configured. Set both ELEVENLABS_API_KEY and ELEVENLABS_VOICE_ID (the supported free-tier option). DEEPSLATE_HOSTED_VOICE_ID is optional and is not required."
             exit 1
+          fi
+          if [ -n "$hosted" ] && { [ -n "$eleven_key" ] || [ -n "$eleven_voice" ]; }; then
+            echo "::notice::Both TTS backends are configured; the plugin prefers DEEPSLATE_HOSTED_VOICE_ID."
           fi
 
           echo "Agent secret names supplied: ${order[*]}"
@@ -237,8 +320,7 @@ jobs:
             echo "AGENT_NAME=${values[LIVEKIT_AGENT_NAME]:-}"
           } >> "$GITHUB_OUTPUT"
 
-          # Expose the resolved provider configuration to the next step only so
-          # `npm run check:env` can validate it without a populated .env file.
+          # Expose the provider configuration to `npm run check:env` only.
           for key in "${!values[@]}"; do
             case "$key" in
               DEEPSLATE_*|ELEVENLABS_*)
@@ -264,10 +346,92 @@ jobs:
           fi
           npm run check:env
 
-      # OPERATION "deploy" ships a new version of the agent named in
-      # livekit.toml. OPERATION "create" is deliberately never used.
+      # OPERATION "create" registers a new LiveKit Cloud agent and deploys it.
+      # The official action writes livekit.toml into WORKING_DIRECTORY. It exits
+      # without creating anything if livekit.toml already exists, which the
+      # preflight above has already ruled out.
+      - name: Create new LiveKit Cloud agent
+        id: create
+        if: ${{ inputs.operation == 'create' }}
+        uses: livekit/deploy-action@v2.12.2
+        env:
+          LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
+          LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
+          LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
+          SECRET_LIST: ${{ steps.secrets.outputs.SECRET_LIST }}
+        with:
+          OPERATION: create
+          WORKING_DIRECTORY: "."
+          REGION: ${{ inputs.region }}
+
+      - name: Verify generated livekit.toml
+        if: ${{ inputs.operation == 'create' }}
+        run: |
+          set -euo pipefail
+          if [ ! -f livekit.toml ]; then
+            echo "::error::The create operation did not produce livekit.toml. The agent may exist but cannot be deployed safely; download the run log and check LiveKit Cloud before retrying."
+            exit 1
+          fi
+
+          config_subdomain="$(sed -n 's/^[[:space:]]*subdomain[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
+          agent_id="$(sed -n 's/^[[:space:]]*id[[:space:]]*=[[:space:]]*"\([^"]*\)".*/\1/p' livekit.toml | head -n 1)"
+
+          if [ -z "$agent_id" ]; then
+            echo "::error::livekit.toml was generated without an [agent] id. Refusing to continue because later runs could create another agent."
+            exit 1
+          fi
+          case "$agent_id" in
+            CA_*) : ;;
+            *)
+              echo "::error::Generated agent id does not look like a LiveKit Cloud agent id (expected CA_...)."
+              exit 1
+              ;;
+          esac
+          if [ "$config_subdomain" != "${PROJECT_SUBDOMAIN}" ]; then
+            echo "::error::Generated livekit.toml targets '$config_subdomain' but LIVEKIT_URL is '${PROJECT_SUBDOMAIN}'."
+            exit 1
+          fi
+
+          echo "AGENT_ID=$agent_id" >> "$GITHUB_ENV"
+          echo "Created agent id: $agent_id"
+
+      - name: Upload generated livekit.toml
+        if: ${{ always() && inputs.operation == 'create' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: livekit-agent-config
+          path: livekit.toml
+          if-no-files-found: warn
+
+      # Persist the new identity so the next run can deploy instead of create.
+      # If the branch is protected and this push is rejected, the artifact above
+      # is the manual recovery path; the run fails loudly rather than letting a
+      # later create run register a second agent.
+      - name: Commit generated livekit.toml
+        if: ${{ inputs.operation == 'create' }}
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add livekit.toml
+          if git diff --cached --quiet; then
+            echo "livekit.toml is already committed; nothing to push."
+            exit 0
+          fi
+          git commit -m "Add generated LiveKit agent config for ${AGENT_ID}"
+          git pull --rebase --autostash origin "${GITHUB_REF_NAME}"
+          if ! git push origin "HEAD:refs/heads/${GITHUB_REF_NAME}"; then
+            echo "::error::Agent ${AGENT_ID} was created, but livekit.toml could not be pushed to '${GITHUB_REF_NAME}'. Download the 'livekit-agent-config' artifact and commit it before running create again. Do NOT re-run create, or a second agent will be registered."
+            exit 1
+          fi
+          echo "Committed livekit.toml for ${AGENT_ID} to ${GITHUB_REF_NAME}."
+
+      # OPERATION "deploy" ships a new version of the agent named in the
+      # committed livekit.toml. It is never used by the create path, and the
+      # create operation above is never used here.
       - name: Deploy new version of the existing agent
         id: deploy
+        if: ${{ inputs.operation == 'deploy' }}
         uses: livekit/deploy-action@v2.12.2
         env:
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
@@ -279,8 +443,9 @@ jobs:
           WORKING_DIRECTORY: "."
           REGION: ${{ inputs.region }}
 
-      - name: Wait for the new version to become healthy
+      - name: Wait for the agent to become healthy
         id: status
+        if: ${{ success() }}
         uses: livekit/deploy-action@v2.12.2
         env:
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
@@ -293,6 +458,7 @@ jobs:
 
       - name: Install LiveKit CLI
         id: cli
+        if: ${{ success() }}
         run: |
           set -euo pipefail
           curl -sSL https://get.livekit.io/cli | bash
@@ -301,6 +467,7 @@ jobs:
           echo "$HOME/.local/bin" >> "$GITHUB_PATH"
 
       - name: Show deployed agent status and version
+        if: ${{ success() }}
         env:
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
           LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
@@ -309,26 +476,32 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p diagnostics
+          if [ -z "${AGENT_ID:-}" ]; then
+            echo "::error::No agent id resolved; refusing to report status for an unknown agent."
+            exit 1
+          fi
           lk agent status --id "$AGENT_ID" | tee diagnostics/agent-status.txt
 
       # Proves the deployed worker accepts a job and joins a real LiveKit room.
-      # It does not publish microphone audio; the manual console test in
-      # README section 6 covers speech, barge-in and recovery.
+      # It does not publish microphone audio; the manual console test covers
+      # speech, barge-in and recovery. SMOKE_EXPECT_AGENT_NAME makes the client
+      # reject a different agent participant when an explicit name is set.
       - name: Room connection smoke test
         id: smoke
-        if: ${{ inputs.room_smoke_test }}
+        if: ${{ success() && inputs.room_smoke_test }}
         env:
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
           LIVEKIT_API_KEY: ${{ secrets.LIVEKIT_API_KEY }}
           LIVEKIT_API_SECRET: ${{ secrets.LIVEKIT_API_SECRET }}
           LIVEKIT_AGENT_NAME: ${{ steps.secrets.outputs.AGENT_NAME }}
+          SMOKE_EXPECT_AGENT_NAME: ${{ steps.secrets.outputs.AGENT_NAME }}
         run: |
           set -euo pipefail
-          room="stage1-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          room="agent-smoke-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
           args=(
             --join
             --room "$room"
-            --identity stage1-smoke
+            --identity ci-smoke
             --valid-for 10m
             --grant '{"canPublish":false,"canSubscribe":false}'
             --token-only
@@ -357,11 +530,15 @@ jobs:
         run: |
           set -euo pipefail
           mkdir -p diagnostics
+          if [ -z "${AGENT_ID:-}" ]; then
+            echo "No agent id resolved; skipping log collection."
+            exit 0
+          fi
           timeout 30s lk agent logs --id "$AGENT_ID" --log-type deploy 2>&1 | tee diagnostics/agent-deploy.log || true
           timeout 30s lk agent logs --id "$AGENT_ID" --log-type build 2>&1 | tee diagnostics/agent-build.log || true
 
-          # A clear, deterministic configuration failure must fail the run even
-          # if the agent container stayed up. Only names appear in these errors.
+          # A deterministic configuration failure must fail the run even if the
+          # agent container stayed up. Only variable names appear in these errors.
           if grep -aqE 'Missing required environment variable|No audio output configured for Opal' diagnostics/agent-deploy.log; then
             echo "::error::Agent logs report a configuration failure. See the deployment diagnostics artifact."
             exit 1
@@ -381,6 +558,8 @@ jobs:
       - name: Report result
         if: ${{ always() }}
         env:
+          OPERATION: ${{ inputs.operation }}
+          CREATE_OUTCOME: ${{ steps.create.outcome }}
           DEPLOY_OUTCOME: ${{ steps.deploy.outcome }}
           STATUS_OUTCOME: ${{ steps.status.outcome }}
           SMOKE_OUTCOME: ${{ steps.smoke.outcome }}
@@ -392,27 +571,38 @@ jobs:
           REGION: ${{ inputs.region }}
         run: |
           set -euo pipefail
-          report="## LiveKit Cloud agent deployment (existing agent)
+          report="## LiveKit Cloud agent: ${OPERATION}
 
           | Item | Result |
           | --- | --- |
+          | Operation | \`$OPERATION\` |
           | Project subdomain | \`$PROJECT_SUBDOMAIN\` |
-          | Agent id | \`$AGENT_ID\` |
-          | LiveKit deploy outcome | \`$DEPLOY_OUTCOME\` |
-          | Health/status outcome | \`$STATUS_OUTCOME\` |
-          | Room connection smoke test | \`$SMOKE_OUTCOME\` |
-          | Log collection | \`$LOGS_OUTCOME\` |
+          | Agent id | \`${AGENT_ID:-(none)}\` |
+          | Create outcome | \`${CREATE_OUTCOME:-skipped}\` |
+          | Deploy outcome | \`${DEPLOY_OUTCOME:-skipped}\` |
+          | Health/status outcome | \`${STATUS_OUTCOME:-skipped}\` |
+          | Room smoke test | \`${SMOKE_OUTCOME:-skipped}\` |
+          | Log collection | \`${LOGS_OUTCOME:-skipped}\` |
           | Branch | \`$BRANCH\` |
           | Commit | \`$COMMIT\` |
           | Region | \`$REGION\` |
           "
+          if [ "$OPERATION" = "create" ]; then
+            report="$report
+          livekit.toml for \`$AGENT_ID\` is committed to this branch (or available as the livekit-agent-config artifact). Later runs must use operation=deploy; do not run create again.
+          "
+          fi
           if [ -n "${GITHUB_STEP_SUMMARY:-}" ]; then
             printf '%s\n' "$report" >> "$GITHUB_STEP_SUMMARY"
           else
             printf '%s\n' "$report"
           fi
-          if [ "$DEPLOY_OUTCOME" != "success" ]; then
-            echo "::error::The LiveKit deploy operation did not succeed. See the deploy step and diagnostics artifact."
+          if [ "$OPERATION" = "create" ] && [ "$CREATE_OUTCOME" != "success" ]; then
+            echo "::error::The LiveKit create operation did not succeed."
+            exit 1
+          fi
+          if [ "$OPERATION" = "deploy" ] && [ "$DEPLOY_OUTCOME" != "success" ]; then
+            echo "::error::The LiveKit deploy operation did not succeed."
             exit 1
           fi
           if [ "$STATUS_OUTCOME" != "success" ]; then
@@ -423,4 +613,4 @@ jobs:
             echo "::error::The deployed agent did not join a real LiveKit room in the smoke test."
             exit 1
           fi
-          echo "Deployment succeeded and the agent reported healthy."
+          echo "Agent $AGENT_ID is created/deployed and healthy."

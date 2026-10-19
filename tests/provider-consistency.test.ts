@@ -80,22 +80,26 @@ describe('single provider', () => {
     }
   });
 
-  it('ships exactly one deployment workflow template with no removed-provider secrets', () => {
+  it('ships one deployment workflow template with explicit create and deploy modes', () => {
     // The repaired workflow lives in deployment/ because this GitHub App lacks
     // the `workflows` permission; see deployment/README.md. Once a human moves
     // it into .github/workflows it must stay identical to this reviewed copy.
     const template = read('deployment/deploy.yml');
+
+    // Both operations are explicit and gated; deploy must never silently fall
+    // back to creating a second agent.
+    assert.match(template, /OPERATION: create/);
     assert.match(template, /OPERATION: deploy/);
-    assert.doesNotMatch(template, /OPERATION: create/);
+    assert.match(template, /if: \$\{\{ inputs\.operation == 'create' \}\}/);
+    assert.match(template, /if: \$\{\{ inputs\.operation == 'deploy' \}\}/);
+    assert.match(template, /confirm_create/);
+    assert.match(template, /no existing agent to deploy/);
+    assert.match(template, /Refusing to create a second agent/);
+    assert.match(template, /SMOKE_EXPECT_AGENT_NAME/);
     assert.doesNotMatch(
       template,
       new RegExp(`${LEGACY_ENV.source}=`),
       'the workflow still supplies a removed-provider secret',
-    );
-    assert.doesNotMatch(
-      template,
-      /livekit\.toml.*(?:>>|tee|write)/i,
-      'the workflow must not rewrite livekit.toml',
     );
 
     if (existsSync(join(ROOT, '.github', 'workflows', 'deploy.yml'))) {

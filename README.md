@@ -86,14 +86,16 @@ Official sources consulted (October 2026):
 | `DEEPSLATE_ORGANIZATION_ID` | Yes | Deepslate organization ID |
 | `DEEPSLATE_API_KEY` | Yes (secret) | Deepslate API key |
 | `DEEPSLATE_MODEL` | No | Pin an Opal model; unset = platform default (`opal-v2.1`) |
-| `DEEPSLATE_HOSTED_VOICE_ID` | One TTS path | Deepslate-hosted (cloned) voice ID |
-| `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID` | Alternative TTS path | Server-side ElevenLabs voice |
+| `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID` | Yes (this deployment) | Server-side ElevenLabs TTS |
+| `DEEPSLATE_HOSTED_VOICE_ID` | No | Optional alternative TTS path if a cloned voice exists |
 | `LIVEKIT_URL`, `LIVEKIT_API_KEY`, `LIVEKIT_API_SECRET` | Yes | LiveKit transport/agent server |
 
 **Audio output is conditional on a TTS config.** In the plugin,
 `audioOutput = options.ttsConfig != null`. With no TTS backend Opal still understands speech and
-produces text, but no audio reaches the room. `src/deepslate.ts` therefore refuses to start without a
-complete hosted-voice or ElevenLabs configuration, and `npm run check:env` reports it.
+produces text, but no audio reaches the room. This deployment uses the plugin's `eleven_labs`
+backend, so `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` are required. A Deepslate-hosted voice is
+supported but is **not required** and this account does not have one. `npm run check:env` reports the
+resolved backend.
 
 ### SDK compatibility (verified)
 
@@ -144,12 +146,13 @@ The running agent imports only `src/deepslate.ts`; a provider-consistency test g
 ## 5. Install and configure
 
 Requirements: Node.js 24 (verified `v24.15.0`; Node >= 22.18 is needed for built-in TypeScript
-type-stripping), npm 11, a LiveKit project, a Deepslate account, and one TTS backend.
+type-stripping), npm 11, a LiveKit project, a Deepslate account, and ElevenLabs TTS (free plan is
+sufficient for non-commercial use; see `deployment/README.md` for the verified limits).
 
 ```bash
 npm install
 cp .env.example .env
-# edit .env: Deepslate IDs/key, LiveKit URL/key/secret, and ONE TTS backend
+# edit .env: Deepslate IDs/key, LiveKit URL/key/secret, ELEVENLABS_API_KEY + ELEVENLABS_VOICE_ID
 npm run check:env
 ```
 
@@ -280,16 +283,16 @@ Environment: Node `v24.15.0`, npm `11.12.1`, Linux. Commands run from the reposi
 | Check | Command | Result |
 | --- | --- | --- |
 | Type check | `npm run typecheck` | **PASS** — 0 errors |
-| Unit/integration tests | `npm test` | **PASS** — 60 tests, 60 passed, 0 failed |
+| Unit/integration tests | `npm test` | **PASS** — 71 tests, 71 passed, 0 failed |
 | Production install | `npm ci --omit=dev` | **PASS** — 174 packages, single `@livekit/rtc-node@1.1.0` |
 | Missing config | `npm run check:env` with no `.env` | **PASS (expected failure)** — exits 1, lists the six missing variables |
 | Agent startup | `node src/main.ts dev` with placeholder creds and an unreachable `ws://127.0.0.1:7880` | **PASS** — worker starts, binds a port, retries with clear `ECONNREFUSED` messages |
 | Secret redaction | grep startup output for the placeholder key/secret | **PASS** — 0 raw matches; values shown as `****` |
-| Opal model init | construct `createRealtimeModel()` with fake env | **PASS** — `model=deepslate-realtime audio=true`, hosted TTS resolved |
+| Opal model init | construct `createRealtimeModel()` with fake env | **PASS** — `model=deepslate-realtime audio=true`, ElevenLabs TTS resolved |
 | **Live Opal conversation** | sections 6.1–6.3 | **NOT RUN — requires a microphone and an operator** |
 | **Deployed agent + room smoke test** | `deployment/deploy.yml` | **NOT RUN — workflow cannot be activated without GitHub `workflows` permission (section 13)** |
 
-The 60 tests include:
+The 71 tests include:
 
 - `tests/deepslate.test.ts` (new): provider construction, explicit credential passing, model
   selection, VAD overrides (including out-of-range rejection), hosted-vs-ElevenLabs resolution,
@@ -302,8 +305,12 @@ The 60 tests include:
   interruption contract: one-word barge-in stops the response, in-flight generation is cancelled,
   cancelled audio is never scheduled, a new response starts afterwards, repeated interruptions do not
   duplicate audio, and the session recovers after a provider drop.
-- `tests/provider-consistency.test.ts` (new): fails if a legacy provider dependency, adapter, env
-  variable or workflow secret reference returns, so the agent cannot silently switch providers.
+- `tests/resilience.test.ts` (new): the real `AgentSession` behind `SessionSupervisor` — one
+  replacement after a fatal provider error, no duplicate sessions during a burst, restart-budget
+  enforcement, no restart when the room is gone, idempotent stop, and room-event detachment.
+- `tests/provider-consistency.test.ts` (updated): fails if a legacy provider dependency, adapter, env
+  variable or workflow secret reference returns, and asserts that the workflow keeps explicit,
+  gated create and deploy modes.
 
 **Honesty note:** the interruption suite exercises LiveKit's real code with a provider double; it does
 not prove Opal's live server VAD. Opal's own `playbackBufferClear → input_speech_started` wiring is
@@ -316,7 +323,7 @@ verified from the pinned plugin source and must be confirmed with the manual int
 | Symptom | Likely cause / fix |
 | --- | --- |
 | `Missing required environment variable(s): ...` | Fill `.env`; run `npm run check:env` |
-| `No audio output configured for Opal` | Set `DEEPSLATE_HOSTED_VOICE_ID` or both `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` |
+| `No audio output configured for Opal` | Set both `ELEVENLABS_API_KEY` and `ELEVENLABS_VOICE_ID` (or a hosted voice, if one exists) |
 | Agent starts but never joins | `LIVEKIT_URL`/keys wrong, or `LIVEKIT_AGENT_NAME` set without requesting that agent in the room token |
 | Joins, but no audio | TTS config missing; check `Audio output (TTS)` in `check:env` output; check browser mic permission |
 | `session error` with Deepslate text | Invalid/expired Deepslate credentials, model access denied, or network failure; values are redacted in logs |
@@ -342,7 +349,9 @@ verified from the pinned plugin source and must be confirmed with the manual int
 | File | Change |
 | --- | --- |
 | `src/deepslate.ts` | Opal model construction, model/VAD/TTS resolution, audio requirement, `ConfigError`s |
-| `src/main.ts` | Uses Opal; validates all config; connects before session start; structured error handling |
+| `src/main.ts` | Uses Opal; validates all config; connects before session start; supervises exactly one session |
+| `src/resilience.ts` | **New.** Bounded provider-session recovery, room lifecycle logging, duplicate-session guard |
+| `src/session.ts` | Provider-independent turn/interruption policy; audio queue + disconnect options |
 | `src/config.ts` | Deepslate required/secret vars, masked summary, float env parsing |
 | `src/check-env.ts` | Validates and reports the TTS backend |
 | `src/session.ts` | Provider-independent turn/interruption policy |
@@ -355,83 +364,129 @@ verified from the pinned plugin source and must be confirmed with the manual int
 | `tests/config.test.ts` | Required-variable, masking/redaction and `LIVEKIT_URL` tests |
 | `tests/session.test.ts` | Turn/interruption policy tests |
 | `tests/interruption.test.ts` | Provider-independent interruption lifecycle against the real LiveKit session |
+| `tests/resilience.test.ts` | **New.** Bounded session recovery, duplicate-session guard, room lifecycle |
 | `tests/fake-realtime-model.ts` | Provider-neutral realtime-model test double (renamed and adapted from the legacy fake) |
 | `tests/phonic.test.ts` | **Deleted.** Legacy vendor wiring test |
 | `tests/provider-consistency.test.ts` | **New.** Guards against reintroducing a second provider |
 | `scripts/room-smoke.ts` | **New.** Joins a real LiveKit room and waits for the deployed agent (no microphone) |
 | `Dockerfile` | Provider comments updated; reproducible `npm ci --omit=dev` install |
-| `deployment/deploy.yml` | **New.** Repaired workflow: verify -> deploy the existing agent -> status -> room smoke test -> logs. Pending activation under `.github/workflows/` (permission blocker) |
-| `deployment/README.md` | **New.** Exact activation steps and required secret names |
+| `deployment/deploy.yml` | **Rewritten.** Explicit create-once and deploy modes, identity guards, generated `livekit.toml` commit/artifact, health checks, smoke test, diagnostics. Pending activation under `.github/workflows/` |
+| `deployment/README.md` | **Rewritten.** Free-tier TTS findings, exact secrets, first-create and redeploy steps, manual `livekit.toml` recovery |
+| `livekit.toml` | **Deleted.** It named the deleted agent (`CA_y4mXvu49sfag`); the create run generates and commits a new one |
 | `.github/workflows/*` | **Unchanged on the remote.** GitHub rejects workflow changes from this App (no `workflows` permission); see section 12 |
 | `README.md` | This report |
 
 ---
 
-## 12. Deployment workflow
+## 12. Deployment workflow (create once, then deploy)
 
-`deployment/deploy.yml` is the repaired workflow. It is manual-only (`workflow_dispatch`) and preserves
-the existing agent identity from the committed `livekit.toml` (`project subdomain =
-shopify-execution-fwmg7op6`, `agent id = CA_y4mXvu49sfag`). It never runs the LiveKit `create`
-operation, never regenerates `livekit.toml`, and refuses to continue if that identity is missing.
+The previous LiveKit Cloud agent was **deleted**, so the old identity
+(`CA_y4mXvu49sfag`) is no longer valid and `livekit.toml` has been removed from
+this repository. The repaired workflow therefore has two explicit,
+non-interchangeable operations:
 
-**It is not active yet.** The App used for this task (`cline-cloud[bot]`) has `contents: write` but no
-`workflows` permission, so this push was rejected:
+- `operation=create` (with `confirm_create=true`) registers a new agent once,
+  deploys it, writes the new `livekit.toml`, uploads it as the
+  `livekit-agent-config` artifact, and commits it back to the branch.
+- `operation=deploy` ships a new version of the agent named in the committed
+  `livekit.toml`. It fails if the file is missing, has no `CA_...` id, or names a
+  different project subdomain than `LIVEKIT_URL`.
 
-```
-! [remote rejected] ... (refusing to allow a GitHub App to create or update workflow
-`.github/workflows/deploy.yml` without `workflows` permission)
-```
+Deploy never falls back to create, and create refuses to run when
+`livekit.toml` already exists or the confirmation input is false. That is what
+prevents a deleted-then-recreated agent from being silently duplicated.
 
-That control was not bypassed. A repository administrator must copy `deployment/deploy.yml` to
-`.github/workflows/deploy.yml`, delete the two old workflow files, and push with a token that has the
-`workflows` permission. Exact commands are in `deployment/README.md`. Until that happens the old
-manual workflow remains active and must not be dispatched: it requires the removed provider's secret
-and would ship this code without Deepslate configuration.
+**It is not active yet.** The App used for this task (`cline-cloud[bot]`) lacks
+the GitHub `workflows` permission, so it cannot write `.github/workflows/**`.
+A repository administrator must install `deployment/deploy.yml` as
+`.github/workflows/deploy.yml`, delete the two obsolete workflow files, and run
+it manually. Exact steps are in `deployment/README.md`. Until then, do not
+dispatch the old manual workflow: it requires the removed provider's secret and
+would ship this code without Deepslate configuration.
 
 Order of operations:
 
 1. `npm ci`, `npm run typecheck`, `npm test`.
-2. Parse and validate `livekit.toml`; refuse to continue if the project or agent id is missing.
-3. Build the deploy-action `SECRET_LIST` from the individual Deepslate/ElevenLabs repository secrets,
-   migrating any legacy `SECRET_LIST` and dropping obsolete vendor entries. Every value is masked
-   with `::add-mask::`; only variable names are printed.
+2. Preflight the identity: create requires confirmation + no `livekit.toml`;
+   deploy requires a committed `CA_...` id whose project matches `LIVEKIT_URL`.
+3. Build the deploy-action `SECRET_LIST` from individual Deepslate/ElevenLabs
+   repository secrets, migrating any legacy `SECRET_LIST` and dropping
+   `PHONIC_*` entries. Every value is masked with `::add-mask::`; only names are
+   printed.
 4. `npm run check:env` with the resolved configuration (masked output).
-5. `livekit/deploy-action@v2.12.2` with `OPERATION: deploy` (never `create`).
-6. `OPERATION: status-retry` (10 minute timeout) to wait for a healthy version.
-7. `lk agent status --id <existing id>` to record the deployed version.
-8. Optional room smoke test: a subscribe-only participant joins a temporary room and waits for the
-   deployed agent (up to 120 s). This proves job dispatch and room connection only.
-9. `lk agent logs` (bounded by `timeout`) captured to the run artifact; deterministic configuration
-   errors fail the run.
-10. A run summary records the project, agent id, commit and each outcome.
+5. `livekit/deploy-action@v2.12.2` with `OPERATION: create` **or**
+   `OPERATION: deploy` — whichever the operator selected; never both.
+6. For create only: verify the generated `livekit.toml`, upload it as an
+   artifact, then commit/push it so later runs deploy instead of create.
+7. `OPERATION: status-retry` (10 minute timeout) to wait for a healthy version.
+8. `lk agent status --id <resolved id>` to record the deployed version.
+9. Optional room smoke test: a subscribe-only participant joins a temporary
+   room and waits for the deployed agent (up to 120 s). It passes
+   `SMOKE_EXPECT_AGENT_NAME` when `LIVEKIT_AGENT_NAME` is set, so another agent
+   cannot make it pass. It proves dispatch/room connection only.
+10. `lk agent logs` (bounded by `timeout`) captured to the run artifact;
+    deterministic configuration errors fail the run.
+11. A run summary records the operation, project, agent id, commit and each
+    outcome.
 
-Repository secret names (values are never printed or committed): `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
-`LIVEKIT_API_SECRET`, `DEEPSLATE_VENDOR_ID`, `DEEPSLATE_ORGANIZATION_ID`, `DEEPSLATE_API_KEY`, and
-`DEEPSLATE_HOSTED_VOICE_ID` (or `ELEVENLABS_API_KEY` + `ELEVENLABS_VOICE_ID`). The workflow also
-honours `DEEPSLATE_MODEL`, the optional `DEEPSLATE_VAD_*` tuning variables, `ELEVENLABS_MODEL_ID`,
-and `LIVEKIT_AGENT_NAME`.
+Required repository secret names: `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
+`LIVEKIT_API_SECRET`, `DEEPSLATE_VENDOR_ID`, `DEEPSLATE_ORGANIZATION_ID`,
+`DEEPSLATE_API_KEY`, `ELEVENLABS_API_KEY`, `ELEVENLABS_VOICE_ID`. Optional:
+`DEEPSLATE_MODEL`, the `DEEPSLATE_VAD_*` tuning variables,
+`ELEVENLABS_MODEL_ID`, `LIVEKIT_AGENT_NAME`, and `DEEPSLATE_HOSTED_VOICE_ID`
+(alternative TTS path; not required).
+
+### Runtime resilience added at the same time
+
+- `SessionSupervisor` (new) closes a dead provider session and starts a fresh
+  `AgentSession` at most twice per job, serialized so a burst of fatal errors
+  cannot create duplicate sessions. The plugin already retries its own socket
+  three times; this covers exhaustion of those retries. No greeting is replayed.
+- Room reconnecting/reconnected events are logged only (the SDK owns room
+  reconnection); a terminal disconnect stops the session and ends the job.
+  Job shutdown closes the session, so a retried job cannot overlap a stale one.
+- `RoomOutputOptions.queueSizeMs` is set to 400 ms, the only agent audio-buffer
+  knob the installed SDK exposes. `@livekit/rtc-node` has no jitter-buffer
+  option, so none is configured.
+
 
 ---
 
 ## 13. Outstanding blockers / manual steps
 
-1. **GitHub workflow permission blocks activation and deployment.** The App token cannot create,
-   update or delete `.github/workflows/**` (`refusing to allow a GitHub App to create or update
-   workflow ... without 'workflows' permission`). The code is pushed; the workflow is in
-   `deployment/deploy.yml`. An administrator must activate it as described in `deployment/README.md`
-   and run it. **No deployment was performed**, so the existing agent was not modified.
-2. **Real microphone acceptance is manual.** The automated room smoke test cannot prove speech
-   recognition, spoken output, barge-in or recovery. Run section 6 with a real microphone.
-3. **A TTS backend must be provisioned.** Either create/clone a voice in the Deepslate platform and
-   use its `DEEPSLATE_HOSTED_VOICE_ID`, or supply an ElevenLabs key + voice ID. Opal will not emit
-   audio without one.
-4. **Known SDK peer-range mismatch.** The plugin advertises `@livekit/rtc-node ^0.13.34` while
-   `@livekit/agents@1.9.3` requires `^1.1.0`. The npm override was verified with a clean install and
-   model construction; if Deepslate publishes a plugin version with an updated peer range, remove the
-   override and re-test.
-5. **Residual audio tail.** Audio already sent over RTP or buffered by the participant cannot be
-   cancelled by the agent (section 7.3). Expect a short tail after a barge-in; this is a transport
-   limit, not a missing cancellation call.
-6. **Packet-loss/jitter/RTT metrics** require a publisher with a media track. The smoke client is
-   subscribe-only, so it records connection state and quality events only; the manual console test
-   covers the real audio path.
+1. **The old agent was deleted and its `livekit.toml` was removed.** The first
+   workflow run must be `operation=create` with `confirm_create=true`, then the
+   generated `livekit.toml` must be committed (the workflow does this
+   automatically; the artifact is the fallback). Later runs use
+   `operation=deploy`. Do not re-run create after an agent exists.
+2. **GitHub workflow permission blocks activation.** The App token cannot
+   create, update or delete `.github/workflows/**`. An administrator must
+   install `deployment/deploy.yml` as `.github/workflows/deploy.yml`, delete the
+   obsolete `phonic-deploy.yml` and `deploy.yml.`, and run it. **No deployment
+   was performed by this change.**
+3. **ElevenLabs TTS must be provisioned.** A free plan is sufficient for
+   non-commercial use, but it requires attribution and cannot use Voice Library
+   voices through the API. Create a default/premade voice or a Voice Design
+   voice and store its id in `ELEVENLABS_VOICE_ID`.
+   `DEEPSLATE_HOSTED_VOICE_ID` is not required.
+4. **Real microphone acceptance is manual.** The automated room smoke test
+   cannot prove speech recognition, spoken output, barge-in or recovery. Run
+   section 6 with a real microphone after the first deployment.
+5. **Known SDK peer-range mismatch.** The plugin advertises
+   `@livekit/rtc-node ^0.13.34` while `@livekit/agents@1.9.3` requires `^1.1.0`.
+   The npm override was verified with a clean install and model construction;
+   if Deepslate publishes a plugin version with an updated peer range, remove
+   the override and re-test.
+6. **Residual audio tail.** Audio already sent over RTP or buffered by the
+   participant cannot be cancelled by the agent (section 7.3). Expect a short
+   tail after a barge-in; this is a transport limit, not a missing cancellation
+   call.
+7. **Packet-loss/jitter/RTT metrics** require a publisher with a media track.
+   The smoke client is subscribe-only, so it records connection state and
+   quality events only; the manual console test covers the real audio path.
+   `@livekit/rtc-node` exposes no jitter-buffer setting, so none is configured.
+8. **Branch protection may reject the generated-file commit.** If the push in
+   the create run fails, download the `livekit-agent-config` artifact and commit
+   it manually; the run fails with that instruction instead of allowing a
+   second create.
+
