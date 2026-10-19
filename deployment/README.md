@@ -1,5 +1,12 @@
 # Deployment workflow: create, then deploy, the same LiveKit Cloud agent
 
+> **Native Opal STS status (2026-10-19): not available.** Deepslate Realtime API
+> `0.1.23` emits text only when `tts_configuration` is omitted; the plugin derives
+> `audioOutput` from `ttsConfig`. This workflow therefore still configures a TTS
+> backend and must not be described as native speech-to-speech. Run
+> `npm run probe:native-sts` with your credentials to verify the server behaviour
+> for your account; see the root `README.md` section “Native Opal STS status”.
+
 `deployment/deploy.yml` is the reviewed, manual-only workflow. Install it as
 `.github/workflows/deploy.yml` (the `cline-cloud[bot]` GitHub App cannot write
 `.github/workflows/**` without the `workflows` permission).

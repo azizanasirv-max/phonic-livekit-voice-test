@@ -119,6 +119,93 @@ resolved backend.
    through LiveKit's audio output to the participant.
 4. Turn taking is Opal's server-side VAD (start/stop durations, confidence, volume, backbuffer).
 
+### Native Opal STS status (blocked upstream as of 2026-10-19)
+
+**Native Opal speech-to-speech audio output is not available through the
+installed Deepslate Realtime API + `@deepslate-labs/livekit@0.1.23`.** This is a
+server/API limitation, not a TypeScript or adapter bug:
+
+- `InitializeSessionRequest` has no native-audio/output-mode field. Its
+  `tts_configuration` is optional, and the API reference says: *“Optional
+  text-to-speech configuration. If omitted, raw text fragments are sent.”*
+- `ModelAudioChunk` is documented as *“TTS audio output when a TTS provider is
+  configured”*; the WebSocket guide says it is sent *“only when a TTS provider
+  is configured.”*
+- In `@deepslate-labs/livekit`, `audioOutput` and the generation modalities are
+  derived from `ttsConfig != null`; without it the plugin closes the audio
+  stream and declares `text` only.
+- The official Python SDK documents the same rule: *“When None (default), only
+  text output is provided.”*
+- The maintainer confirmed in the SDK repository that an unresolved TTS voice
+  causes a silent fallback to text-only responses — there is no native audio
+  fallback.
+
+Sources: [Opal](https://docs.deepslate.eu/opal) (the model supports a full S2S
+mode), [Realtime protocol](https://docs.deepslate.eu/api-reference/realtime),
+[WebSocket](https://docs.deepslate.eu/websocket),
+[LiveKit Node](https://docs.deepslate.eu/livekit-node), and
+[deepslate-sdks](https://github.com/deepslate-labs/deepslate-sdks).
+
+A protocol comment in `ChatAudioData` mentions *“model-output audio (not
+TTS-synthesized)”*, but no documented request field or streaming mode selects
+it, and `ModelAudioChunk` itself is documented as TTS-only. It is not a usable
+native-STS switch.
+
+**There is no official newer package that changes this.** `0.1.23` is the latest
+published `@deepslate-labs/livekit`/`@deepslate-labs/core` version, and the
+public GitHub `main` still has the same `ttsConfig`-gated behaviour.
+
+#### What this repository now provides
+
+- `src/native-sts.ts` — a provider-independent observation/verdict layer that
+  distinguishes a real completed response with model audio from a text-only
+  response. It never synthesizes audio.
+- `scripts/probe-native-sts.ts` — a live diagnostic that opens a real
+  `DeepslateSession` with **no** `tts_configuration`, sends one text prompt, and
+  reports whether the server actually emits `modelAudioChunk` audio.
+- `tests/native-sts.test.ts` — unit tests for the observation logic (mocked;
+  they do not prove server behaviour).
+
+Run the live probe with your own Deepslate credentials (never committed):
+
+```bash
+DEEPSLATE_VENDOR_ID=... \
+DEEPSLATE_ORGANIZATION_ID=... \
+DEEPSLATE_API_KEY=... \
+npm run probe:native-sts
+```
+
+- Exit `0` + “NATIVE MODEL AUDIO OBSERVED”: the server exposed model audio on
+  that session; the next step is a production adapter.
+- Exit `2` + `audio chunks=0`: native STS is not exposed by that
+  account/server. Do not describe the agent as native STS.
+- Exit `1`: missing configuration.
+
+The probe sends a text prompt rather than microphone audio. It proves the
+server's **output** path; audio input is already documented and supported by the
+same session. A full native-STS live test still requires microphone audio once
+the output path exists.
+
+#### Exact upstream work still required
+
+1. **Deepslate Realtime API:** expose Opal's native speech decoder on the
+   realtime session (for example, a documented native output mode, or documented
+   audio output when `tts_configuration` is omitted), and emit incremental
+   native audio chunks with turn/interruption metadata.
+2. **`@deepslate-labs/core`:** expose the corresponding option in
+   `DeepslateOptions`/`InitializeSessionRequest` and forward native
+   `audioChunk` events without a TTS config.
+3. **`@deepslate-labs/livekit`:** set `audioOutput: true` based on that mode,
+   report `audio`+`text` modalities, map native PCM chunks to `AudioFrame`, and
+   keep interruption/reconnect behaviour.
+4. **This repository:** remove the TTS requirement from `src/deepslate.ts` and
+   the deployment secrets only after upstream (1)–(3) exist and a live probe
+   proves audio.
+
+Until then the working agent remains **text + configured TTS**, not native
+Opal speech output. That is stated explicitly rather than hidden behind a
+fallback.
+
 ---
 
 ## 4. What the code does now
@@ -283,7 +370,7 @@ Environment: Node `v24.15.0`, npm `11.12.1`, Linux. Commands run from the reposi
 | Check | Command | Result |
 | --- | --- | --- |
 | Type check | `npm run typecheck` | **PASS** — 0 errors |
-| Unit/integration tests | `npm test` | **PASS** — 71 tests, 71 passed, 0 failed |
+| Unit/integration tests | `npm test` | **PASS** — 76 tests, 76 passed, 0 failed |
 | Production install | `npm ci --omit=dev` | **PASS** — 174 packages, single `@livekit/rtc-node@1.1.0` |
 | Missing config | `npm run check:env` with no `.env` | **PASS (expected failure)** — exits 1, lists the six missing variables |
 | Agent startup | `node src/main.ts dev` with placeholder creds and an unreachable `ws://127.0.0.1:7880` | **PASS** — worker starts, binds a port, retries with clear `ECONNREFUSED` messages |
@@ -292,7 +379,7 @@ Environment: Node `v24.15.0`, npm `11.12.1`, Linux. Commands run from the reposi
 | **Live Opal conversation** | sections 6.1–6.3 | **NOT RUN — requires a microphone and an operator** |
 | **Deployed agent + room smoke test** | `deployment/deploy.yml` | **NOT RUN — workflow cannot be activated without GitHub `workflows` permission (section 13)** |
 
-The 71 tests include:
+The 76 tests include:
 
 - `tests/deepslate.test.ts` (new): provider construction, explicit credential passing, model
   selection, VAD overrides (including out-of-range rejection), hosted-vs-ElevenLabs resolution,
@@ -308,6 +395,9 @@ The 71 tests include:
 - `tests/resilience.test.ts` (new): the real `AgentSession` behind `SessionSupervisor` — one
   replacement after a fatal provider error, no duplicate sessions during a burst, restart-budget
   enforcement, no restart when the room is gone, idempotent stop, and room-event detachment.
+- `tests/native-sts.test.ts` (new): the observation/verdict layer that distinguishes a completed
+  response with real model audio from a text-only response. These are mocked tests; the live
+  capability is only proven by `npm run probe:native-sts` against a real Deepslate account.
 - `tests/provider-consistency.test.ts` (updated): fails if a legacy provider dependency, adapter, env
   variable or workflow secret reference returns, and asserts that the workflow keeps explicit,
   gated create and deploy modes.
@@ -351,6 +441,7 @@ verified from the pinned plugin source and must be confirmed with the manual int
 | `src/deepslate.ts` | Opal model construction, model/VAD/TTS resolution, audio requirement, `ConfigError`s |
 | `src/main.ts` | Uses Opal; validates all config; connects before session start; supervises exactly one session |
 | `src/resilience.ts` | **New.** Bounded provider-session recovery, room lifecycle logging, duplicate-session guard |
+| `src/native-sts.ts` | **New.** Native-STS observation/verdict logic; never synthesizes audio |
 | `src/session.ts` | Provider-independent turn/interruption policy; audio queue + disconnect options |
 | `src/config.ts` | Deepslate required/secret vars, masked summary, float env parsing |
 | `src/check-env.ts` | Validates and reports the TTS backend |
@@ -359,16 +450,18 @@ verified from the pinned plugin source and must be confirmed with the manual int
 | `src/logging.ts` | Redacts credentials from every log line |
 | `src/phonic.ts` | **Deleted.** Legacy vendor adapter; nothing imports it any more |
 | `.env.example` | Deepslate + TTS + VAD placeholders; no legacy variables |
-| `package.json`, `package-lock.json` | Deepslate plugin added, legacy plugin removed, `@livekit/rtc-node` override, renamed package |
+| `package.json`, `package-lock.json` | Deepslate plugin/core, legacy plugin removed, `@livekit/rtc-node` override, renamed package, `probe:native-sts` script |
 | `tests/deepslate.test.ts` | Opal provider/configuration/capability tests |
 | `tests/config.test.ts` | Required-variable, masking/redaction and `LIVEKIT_URL` tests |
 | `tests/session.test.ts` | Turn/interruption policy tests |
 | `tests/interruption.test.ts` | Provider-independent interruption lifecycle against the real LiveKit session |
 | `tests/resilience.test.ts` | **New.** Bounded session recovery, duplicate-session guard, room lifecycle |
+| `tests/native-sts.test.ts` | **New.** Native-audio observation/verdict tests (mocked) |
 | `tests/fake-realtime-model.ts` | Provider-neutral realtime-model test double (renamed and adapted from the legacy fake) |
 | `tests/phonic.test.ts` | **Deleted.** Legacy vendor wiring test |
 | `tests/provider-consistency.test.ts` | **New.** Guards against reintroducing a second provider |
 | `scripts/room-smoke.ts` | **New.** Joins a real LiveKit room and waits for the deployed agent (no microphone) |
+| `scripts/probe-native-sts.ts` | **New.** Live diagnostic: no `tts_configuration`, reports whether Deepslate emits model audio |
 | `Dockerfile` | Provider comments updated; reproducible `npm ci --omit=dev` install |
 | `deployment/deploy.yml` | **Rewritten.** Explicit create-once and deploy modes, identity guards, generated `livekit.toml` commit/artifact, health checks, smoke test, diagnostics. Pending activation under `.github/workflows/` |
 | `deployment/README.md` | **Rewritten.** Free-tier TTS findings, exact secrets, first-create and redeploy steps, manual `livekit.toml` recovery |
@@ -454,6 +547,15 @@ Required repository secret names: `LIVEKIT_URL`, `LIVEKIT_API_KEY`,
 
 ## 13. Outstanding blockers / manual steps
 
+0. **Native Opal STS remains blocked upstream.** The installed Deepslate Realtime
+   API/plugin (`0.1.23`, also latest on npm and GitHub `main`) emits text only
+   when `tts_configuration` is omitted; `ModelAudioChunk` is TTS-only. The
+   repository now contains an honest **live probe**
+   (`npm run probe:native-sts`) and observation tests, but no production native
+   audio adapter, because there is no server-side native audio to consume. Do
+   not claim native STS until the probe returns actual audio chunks and the
+   upstream API/SDK/adapter changes in the README section “Native Opal STS
+   status” exist.
 1. **The old agent was deleted and its `livekit.toml` was removed.** The first
    workflow run must be `operation=create` with `confirm_create=true`, then the
    generated `livekit.toml` must be committed (the workflow does this

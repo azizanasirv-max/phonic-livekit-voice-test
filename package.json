@@ -13,9 +13,11 @@
     "typecheck": "tsc --noEmit",
     "test": "node --test \"tests/*.test.ts\"",
     "check:env": "node src/check-env.ts",
+    "probe:native-sts": "node scripts/probe-native-sts.ts",
     "download-files": "livekit-agents download-files"
   },
   "dependencies": {
+    "@deepslate-labs/core": "0.1.23",
     "@deepslate-labs/livekit": "0.1.23",
     "@livekit/agents": "1.9.3",
     "@livekit/rtc-node": "^1.1.0",

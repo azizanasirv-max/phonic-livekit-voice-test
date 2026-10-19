@@ -21,6 +21,13 @@
 # ELEVENLABS_VOICE_ID are therefore required. DEEPSLATE_HOSTED_VOICE_ID is
 # still accepted if it is ever added, but it is NOT required.
 #
+# NATIVE OPAL STS STATUS (2026-10-19): NOT AVAILABLE in Deepslate Realtime API
+# 0.1.23. With tts_configuration omitted the server returns text only, and the
+# plugin derives audioOutput from ttsConfig. This workflow therefore still
+# configures a TTS backend. Do not describe this deployment as native
+# speech-to-speech. See README "Native Opal STS status" and run
+# `npm run probe:native-sts` against your account to verify.
+#
 # Repository secrets (Settings -> Secrets and variables -> Actions):
 #   Required:
 #     LIVEKIT_URL, LIVEKIT_API_KEY, LIVEKIT_API_SECRET
