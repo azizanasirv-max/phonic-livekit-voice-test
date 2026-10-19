@@ -1,10 +1,10 @@
 /**
- * Interruption-lifecycle regression tests for the Phonic ↔ LiveKit integration.
+ * Interruption-lifecycle regression tests for the LiveKit realtime integration.
  *
  * These run the **real** `AgentSession`, realtime-generation and audio-playback
- * machinery from the installed `@livekit/agents`, with only Phonic replaced by
- * `FakePhonicRealtimeModel` (see `fake-phonic-realtime.ts`). No network calls,
- * no Phonic credentials, no audio devices.
+ * machinery from the installed `@livekit/agents`, with only the provider replaced by
+ * `FakeRealtimeModel` (see `fake-realtime-model.ts`). No network calls,
+ * no provider credentials, no audio devices.
  *
  * What each test pins down:
  *
@@ -14,8 +14,8 @@
  * 3. audio from a cancelled response is never scheduled after the cancellation;
  * 4. a new response starts normally after the interruption;
  * 5. repeated interruptions leave no duplicated or overlapping responses;
- * 6. the session recovers after Phonic disconnects and after a clean close;
- * 7. the turn-handling policy keeps Phonic's server-side turn detection and
+ * 6. the session recovers after the provider disconnects and after a clean close;
+ * 7. the turn-handling policy keeps the provider's server-side turn detection and
  *    never resumes an interrupted response.
  */
 import assert from 'node:assert/strict';
@@ -24,8 +24,8 @@ import { initializeLogger, voice } from '@livekit/agents';
 
 import { createAgent } from '../src/agent.ts';
 import { createAgentSession, resolveTurnHandling } from '../src/session.ts';
-import { FakePhonicRealtimeModel, RecordingAudioOutput } from './fake-phonic-realtime.ts';
-import type { FakePhonicRealtimeSession } from './fake-phonic-realtime.ts';
+import { FakeRealtimeModel, RecordingAudioOutput } from './fake-realtime-model.ts';
+import type { FakeRealtimeSession } from './fake-realtime-model.ts';
 
 // The SDK requires its logger to be initialized before a session is created.
 initializeLogger({ pretty: false, level: 'silent' });
@@ -40,8 +40,8 @@ async function settle(ticks = 10): Promise<void> {
 }
 
 type Harness = {
-  model: FakePhonicRealtimeModel;
-  rt: FakePhonicRealtimeSession;
+  model: FakeRealtimeModel;
+  rt: FakeRealtimeSession;
   session: voice.AgentSession;
   output: RecordingAudioOutput;
   speeches: voice.SpeechHandle[];
@@ -49,9 +49,9 @@ type Harness = {
   errors: unknown[];
 };
 
-/** Start a session over the fake Phonic model, wired exactly like production. */
+/** Start a session over the fake the provider model, wired exactly like production. */
 async function startHarness(): Promise<Harness> {
-  const model = new FakePhonicRealtimeModel();
+  const model = new FakeRealtimeModel();
   const session = createAgentSession(model);
   const output = new RecordingAudioOutput();
   session.output.audio = output;
@@ -63,7 +63,7 @@ async function startHarness(): Promise<Harness> {
     speeches: [] as voice.SpeechHandle[],
     agentStates: [] as voice.AgentState[],
     errors: [] as unknown[],
-    rt: undefined as unknown as FakePhonicRealtimeSession,
+    rt: undefined as unknown as FakeRealtimeSession,
   };
 
   session.on(voice.AgentSessionEventTypes.SpeechCreated, (event) => {
@@ -82,7 +82,7 @@ async function startHarness(): Promise<Harness> {
 }
 
 describe('interruption lifecycle', () => {
-  it('stops the assistant when Phonic reports a short (one-word) utterance', async () => {
+  it('stops the assistant when the provider reports a short (one-word) utterance', async () => {
     const h = await startHarness();
 
     const speech = h.session.generateReply();
@@ -91,7 +91,7 @@ describe('interruption lifecycle', () => {
     await settle();
     assert.ok(h.output.framesCaptured > 0, 'the response should be playing');
 
-    // Phonic's server-side VAD hears one word and reports `user_started_speaking`.
+    // The provider's server-side VAD hears one word and reports `user_started_speaking`.
     // With `minWordsToInterrupt: 1` that is already an interruption.
     h.rt.userStartedSpeaking();
     await settle();
@@ -99,7 +99,7 @@ describe('interruption lifecycle', () => {
     assert.equal(speech.interrupted, true, 'the active response must be interrupted');
     assert.equal(h.rt.turnsInterrupted, 1);
     assert.ok(h.output.clears >= 1, 'queued audio must be dropped from the playback path');
-    assert.equal(h.rt.turnOpen, false, 'no Phonic turn may be left open');
+    assert.equal(h.rt.turnOpen, false, 'no provider turn may be left open');
 
     await h.session.close();
   });
@@ -112,7 +112,7 @@ describe('interruption lifecycle', () => {
     h.rt.pushAssistantAudio('A long reply that is still');
     await settle();
 
-    // The generation is still open: Phonic has not finished speaking.
+    // The generation is still open: the provider has not finished speaking.
     assert.equal(h.rt.turnOpen, true);
     const framesBefore = h.output.framesCaptured;
 
@@ -141,7 +141,7 @@ describe('interruption lifecycle', () => {
     const framesBefore = h.output.framesCaptured;
     assert.equal(framesBefore, 1);
 
-    // Phonic streams ahead of real time, so at the moment the interruption lands
+    // the provider streams ahead of real time, so at the moment the interruption lands
     // several more chunks of the *same* response are already buffered in the
     // generation's audio stream. This models the worst case — the provider
     // reports user speech but keeps its generation open — so those frames stay
@@ -213,9 +213,9 @@ describe('interruption lifecycle', () => {
     assert.equal(first.interrupted, true);
     const framesAfterInterrupt = h.output.framesCaptured;
 
-    // The user finishes their turn and Phonic starts the next response.
+    // The user finishes their turn and the provider starts the next response.
     h.rt.userFinishedSpeaking();
-    const nextTurn = h.rt.assistantTurnFromPhonic();
+    const nextTurn = h.rt.assistantTurnFromProvider();
     assert.equal(nextTurn.userInitiated, false);
     await settle();
     assert.equal(h.rt.pushAssistantAudio('the second reply'), true);
@@ -284,7 +284,7 @@ describe('interruption lifecycle', () => {
     await h.session.close();
   });
 
-  it('recovers after Phonic disconnects mid-response', async () => {
+  it('recovers after the provider disconnects mid-response', async () => {
     const h = await startHarness();
 
     const speech = h.session.generateReply();
@@ -295,7 +295,7 @@ describe('interruption lifecycle', () => {
 
     // Mirrors the plugin's socket `close` handler: drop the open generation and
     // report the abnormal close.
-    h.rt.simulateSocketClose(1006);
+    h.rt.simulateProviderDisconnect(1006);
     await settle();
 
     assert.equal(h.rt.turnOpen, false, 'the in-flight generation must be dropped');
@@ -363,12 +363,12 @@ describe('interruption lifecycle', () => {
     await fresh.session.close();
   });
 
-  it('pins Phonic server-side turn detection and never resumes an interrupted response', () => {
-    const model = new FakePhonicRealtimeModel();
+  it('pins the provider server-side turn detection and never resumes an interrupted response', () => {
+    const model = new FakeRealtimeModel();
     const session = createAgentSession(model);
     const { turnDetection, interruption } = session.sessionOptions.turnHandling;
 
-    // Phonic's own turn detection stays in charge.
+    // the provider's own turn detection stays in charge.
     assert.equal(turnDetection, 'realtime_llm');
     assert.equal(model.capabilities.turnDetection, true);
     assert.notEqual(model.capabilities.supportsOverlappingSpeech, true);
@@ -377,7 +377,7 @@ describe('interruption lifecycle', () => {
     assert.equal(interruption.enabled, true);
     assert.equal(interruption.resumeFalseInterruption, false);
     assert.equal(interruption.discardAudioIfUninterruptible, true);
-    // No second client-side threshold on top of Phonic's `minWordsToInterrupt`.
+    // No second client-side threshold on top of the provider-side interruption gate.
     assert.equal(interruption.minWords, 0);
     assert.equal(interruption.minDuration, 0);
 

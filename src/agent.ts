@@ -1,8 +1,8 @@
 /**
  * The conversational agent definition (prompt only — no tools, no database).
  *
- * Phonic handles speech-to-speech generation; this file only supplies the
- * instructions that shape how the agent talks.
+ * Opal handles speech-to-speech generation; this file only supplies the
+ * instructions that shape how the agent talks. It is provider-independent.
  */
 import { voice } from '@livekit/agents';
 import { AGENT_INSTRUCTIONS } from './instructions.ts';
