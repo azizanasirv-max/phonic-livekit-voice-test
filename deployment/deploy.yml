@@ -125,6 +125,7 @@ jobs:
         env:
           OPERATION: ${{ inputs.operation }}
           CONFIRM_CREATE: ${{ inputs.confirm_create }}
+          REGION: ${{ inputs.region }}
           LIVEKIT_URL: ${{ secrets.LIVEKIT_URL }}
         run: |
           set -euo pipefail
